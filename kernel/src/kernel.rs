@@ -177,7 +177,7 @@ macro_rules! sync_trace {
         if SYNC_TRACE.load(Ordering::Relaxed) {
             let msg = format!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
             println!("{}", msg);
-            if let Ok(mut buf) = TRACE_BUF.lock() {
+            if let Ok(mut buf) = TRACE_BUF.try_lock() {
                 if buf.len() >= TRACE_BUF_CAP { buf.pop_front(); }
                 buf.push_back(msg);
             }
@@ -186,7 +186,7 @@ macro_rules! sync_trace {
 }
 
 pub fn sync_trace_dump() {
-    match TRACE_BUF.lock() {
+    match TRACE_BUF.try_lock() {
         Ok(buf) => {
             println!("=== SYNC TRACE (last {}) ===", buf.len());
             for entry in buf.iter() {
@@ -194,13 +194,8 @@ pub fn sync_trace_dump() {
             }
             println!("=== END TRACE ===");
         }
-        Err(poisoned) => {
-            let buf = poisoned.into_inner();
-            println!("=== SYNC TRACE (poisoned, last {}) ===", buf.len());
-            for entry in buf.iter() {
-                println!("{}", entry);
-            }
-            println!("=== END TRACE ===");
+        Err(_) => {
+            println!("=== SYNC TRACE: buffer locked, cannot dump ===");
         }
     }
 }
