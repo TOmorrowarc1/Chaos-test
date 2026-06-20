@@ -183,7 +183,7 @@ macro_rules! sync_trace {
                 }));
             });
             let msg = format!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
-            if let Ok(mut buf) = TRACE_BUF.try_lock() {
+            if let Ok(mut buf) = TRACE_BUF.lock() {
                 if buf.len() >= TRACE_BUF_CAP { buf.pop_front(); }
                 buf.push_back(msg);
             }
