@@ -462,12 +462,14 @@ impl SyncQueue {
     pub fn wait_guard<T>(&self, g: &Mutex<T>) {
         sync_trace!("SyncQueue::wait_guard: lock self.q");
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
+        sync_trace!("SyncQueue::wait_guard: lock g");
         drop(g.lock().unwrap());
         thread::park();
     }
     pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
         sync_trace!("SyncQueue::wait_timeout: lock self.q");
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
+        sync_trace!("SyncQueue::wait_timeout: lock g");
         drop(g.lock().unwrap());
         thread::park_timeout(timeout);
         true
@@ -2463,7 +2465,7 @@ impl FHandle {
         let mut d = self.desc.write().unwrap();
         d.off = match pos {
             FSeek::Start(o) => o,
-            FSeek::End(o) => (self.data.lock().unwrap().len() as isize + o) as usize,
+            FSeek::End(o) => { sync_trace!("FHandle::seek: lock self.data"); (self.data.lock().unwrap().len() as isize + o) as usize }
             FSeek::Cur(o) => (d.off as isize + o) as usize,
         };
         Ok(d.off)
@@ -4633,6 +4635,7 @@ impl Task {
     pub fn exited(&self) -> bool {
         sync_trace!("Task::exited: lock self.threads");
         let t = self.threads.lock().unwrap();
+        sync_trace!("Task::exited: lock self.info");
         t.is_empty() || self.info.lock().unwrap().status.is_some()
     }
     pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
@@ -4817,14 +4820,14 @@ impl TaskTable {
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::process_of_tid: lock self.map(R)");
         self.map.read().unwrap().values()
-            .find(|t| t.threads.lock().unwrap().contains(&tid))
+            .find(|t| { sync_trace!("TaskTable::process_of_tid: lock t.threads"); t.threads.lock().unwrap().contains(&tid) })
             .cloned()
     }
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::pgid_group: lock self.map(R)");
         self.map.read().unwrap().values()
-            .filter(|t| *t.pgid.lock().unwrap() == pgid)
+            .filter(|t| { sync_trace!("TaskTable::pgid_group: lock t.pgid"); *t.pgid.lock().unwrap() == pgid })
             .cloned().collect()
     }
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
@@ -6101,7 +6104,7 @@ impl Kernel {
                 };
                 if target == 0 { return Err("esrch"); }
                 match self.tasks.find(target) {
-                    Some(t) => Ok(*t.pgid.lock().unwrap() as usize),
+                    Some(t) => { sync_trace!("dispatch[GETPGID]: lock t.pgid"); Ok(*t.pgid.lock().unwrap() as usize) }
                     None => Err("esrch"),
                 }
             }
@@ -6362,6 +6365,7 @@ impl Kernel {
             format!("/{}", parts.join("/"))
         };
         let resolved = self.mnt.resolve(path)?;
+        sync_trace!("Kernel::lookup_path: lock self.mnt.entries(R)");
         let _cache = rehash_mount_cache(
             &self.mnt.entries.read().unwrap()
         );
@@ -6533,9 +6537,9 @@ impl Kernel {
         for child in &children {
             let matches = match target_pid {
                 -1 => true,
-                0 => *child.pgid.lock().unwrap() == *parent.pgid.lock().unwrap(),
+                0 => { sync_trace!("Kernel::do_wait: lock child.pgid + parent.pgid"); *child.pgid.lock().unwrap() == *parent.pgid.lock().unwrap() }
                 p if p > 0 => child.id() == p as usize,
-                p => *child.pgid.lock().unwrap() == (-p) as Pgid,
+                p => { sync_trace!("Kernel::do_wait: lock child.pgid"); *child.pgid.lock().unwrap() == (-p) as Pgid }
             };
             if matches && child.done() {
                 sync_trace!("Kernel::do_wait: lock child.exit_code");
