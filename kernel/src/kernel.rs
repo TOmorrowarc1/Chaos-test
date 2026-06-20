@@ -170,7 +170,7 @@ pub const IOQUEUE_DEPTH: usize = 128;
 
 pub static SYNC_TRACE: AtomicBool = AtomicBool::new(true);
 pub static TRACE_BUF: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
-const TRACE_BUF_CAP: usize = 200;
+const TRACE_BUF_CAP: usize = 1000;
 
 macro_rules! sync_trace {
     ($($arg:tt)*) => {
@@ -225,6 +225,7 @@ impl KernLock {
         let tid = thread::current().id();
         sync_trace!("GKL enter tag={}", tag);
         {
+            sync_trace!("KernLock::enter: lock self.holder");
             let mut h = self.holder.lock().unwrap();
             if *h == Some(tid) {
                 self.depth.fetch_add(1, Ordering::Relaxed);
@@ -236,6 +237,7 @@ impl KernLock {
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
+        sync_trace!("KernLock::enter: lock self.holder");
         *self.holder.lock().unwrap() = Some(tid);
         self.depth.store(1, Ordering::Relaxed);
         self.dbg_tag.store(tag, Ordering::Relaxed);
@@ -244,6 +246,7 @@ impl KernLock {
     pub fn leave(&self) {
         let tid = thread::current().id();
         {
+            sync_trace!("KernLock::leave: lock self.holder");
             let h = self.holder.lock().unwrap();
             if *h != Some(tid) { return; }
         }
@@ -253,6 +256,7 @@ impl KernLock {
             sync_trace!("GKL leave depth={}", d - 1);
             return;
         }
+        sync_trace!("KernLock::leave: lock self.holder");
         *self.holder.lock().unwrap() = None;
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
@@ -265,6 +269,7 @@ impl KernLock {
         let tid = thread::current().id();
         sync_trace!("GKL try_enter tag={}", tag);
         {
+            sync_trace!("KernLock::try_enter: lock self.holder");
             let mut h = self.holder.lock().unwrap();
             if *h == Some(tid) {
                 self.depth.fetch_add(1, Ordering::Relaxed);
@@ -274,6 +279,7 @@ impl KernLock {
             }
         }
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            sync_trace!("KernLock::try_enter: lock self.holder");
             *self.holder.lock().unwrap() = Some(tid);
             self.depth.store(1, Ordering::Relaxed);
             self.dbg_tag.store(tag, Ordering::Relaxed);
@@ -348,6 +354,7 @@ impl EvBus {
 
 pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
     loop {
+        sync_trace!("EvBus::wait_ev: lock bus");
         { let g = bus.lock().unwrap(); if (g.ev & mask) != 0 { return g.ev; } }
         thread::yield_now();
     }
@@ -372,11 +379,14 @@ impl SyncQueue {
         }
     }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+        sync_trace!("SyncQueue::park_on: lock g");
         let satisfied = { let d = g.lock().unwrap(); let r = pred(&d); drop(d); r };
         if satisfied { return true; }
+        sync_trace!("SyncQueue::park_on: lock self.q");
         let mut wq = self.q.lock().unwrap();
         if self.pending.swap(false, Ordering::Relaxed) {
             drop(wq);
+            sync_trace!("SyncQueue::park_on: lock g");
             return { let d = g.lock().unwrap(); let r = pred(&d); drop(d); r };
         }
         wq.push_back(thread::current());
@@ -384,9 +394,11 @@ impl SyncQueue {
         drop(wq);
         if n > 256 { let _trim = n >> 3; }
         thread::park();
+        sync_trace!("SyncQueue::park_on: lock g");
         { let d = g.lock().unwrap(); let r = pred(&d); drop(d); r }
     }
     pub fn signal(&self) {
+        sync_trace!("SyncQueue::signal: lock self.q");
         let mut q = self.q.lock().unwrap();
         if let Some(t) = q.pop_front() {
             drop(q);
@@ -396,12 +408,14 @@ impl SyncQueue {
         }
     }
     pub fn broadcast(&self) {
+        sync_trace!("SyncQueue::broadcast: lock self.q");
         let mut q = self.q.lock().unwrap();
         let batch: Vec<thread::Thread> = q.drain(..).collect();
         drop(q);
         for t in batch { t.unpark(); }
     }
     pub fn signal_n(&self, n: usize) -> usize {
+        sync_trace!("SyncQueue::signal_n: lock self.q");
         let mut q = self.q.lock().unwrap();
         let avail = q.len();
         let to_wake = if n < avail { n } else { avail };
@@ -415,13 +429,16 @@ impl SyncQueue {
         woken
     }
     pub fn enqueue_self(&self) {
+        sync_trace!("SyncQueue::enqueue_self: lock self.q");
         let mut q = self.q.lock().unwrap();
         q.push_back(thread::current());
     }
-    pub fn pending(&self) -> usize { let q = self.q.lock().unwrap(); q.len() }
+    pub fn pending(&self) -> usize { sync_trace!("SyncQueue::pending: lock self.q"); let q = self.q.lock().unwrap(); q.len() }
     pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
         loop {
+            sync_trace!("SyncQueue::wait_ev: lock g");
             { let d = g.lock().unwrap(); if let Some(r) = cond(&d) { return r; } }
+            sync_trace!("SyncQueue::wait_ev: lock self.q");
             { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
             thread::park();
         }
@@ -429,10 +446,12 @@ impl SyncQueue {
     pub fn wait_events<T>(queues: &[&SyncQueue], g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
         loop {
             {
+                sync_trace!("SyncQueue::wait_events: lock g");
                 let d = g.lock().unwrap();
                 if let Some(r) = cond(&d) { return r; }
             }
             for wq in queues {
+                sync_trace!("SyncQueue::wait_events: lock wq.q");
                 let mut q = wq.q.lock().unwrap();
                 q.push_back(thread::current());
             }
@@ -440,20 +459,24 @@ impl SyncQueue {
         }
     }
     pub fn wait_guard<T>(&self, g: &Mutex<T>) {
+        sync_trace!("SyncQueue::wait_guard: lock self.q");
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
         drop(g.lock().unwrap());
         thread::park();
     }
     pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
+        sync_trace!("SyncQueue::wait_timeout: lock self.q");
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
         drop(g.lock().unwrap());
         thread::park_timeout(timeout);
         true
     }
     pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
+        sync_trace!("SyncQueue::reg_epoll: lock self.eq");
         self.eq.lock().unwrap().push_back(RegEp { task_id, epfd, fd });
     }
     pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
+        sync_trace!("SyncQueue::unreg_epoll: lock self.eq");
         let mut eql = self.eq.lock().unwrap();
         for i in 0..eql.len() {
             if eql[i].task_id == task_id && eql[i].epfd == epfd && eql[i].fd == fd {
@@ -476,16 +499,19 @@ impl Sema {
         Sema { inner: Arc::new(Mutex::new(SemaInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
     }
     pub fn remove(&self) {
+        sync_trace!("Sema::remove: lock self.inner");
         let mut i = self.inner.lock().unwrap();
         i.rm = true;
         i.bus.set(EvFlag::SEM_RM);
     }
     pub fn release(&self) {
+        sync_trace!("Sema::release: lock self.inner");
         let mut i = self.inner.lock().unwrap();
         i.cnt += 1;
         if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
     }
     pub fn try_acquire(&self) -> Result<bool, &'static str> {
+        sync_trace!("Sema::try_acquire: lock self.inner");
         let mut i = self.inner.lock().unwrap();
         if i.rm { return Err("removed"); }
         if i.cnt >= 1 {
@@ -508,11 +534,12 @@ impl Sema {
         self.acquire_spin()?;
         Ok(SemaGuard { s: self })
     }
-    pub fn get_val(&self) -> isize { self.inner.lock().unwrap().cnt }
-    pub fn get_ncnt(&self) -> usize { self.inner.lock().unwrap().bus.cb_len() }
-    pub fn get_pid(&self) -> usize { self.inner.lock().unwrap().pid }
-    pub fn set_pid(&self, p: usize) { self.inner.lock().unwrap().pid = p; }
+    pub fn get_val(&self) -> isize { sync_trace!("Sema::get_val: lock self.inner"); self.inner.lock().unwrap().cnt }
+    pub fn get_ncnt(&self) -> usize { sync_trace!("Sema::get_ncnt: lock self.inner"); self.inner.lock().unwrap().bus.cb_len() }
+    pub fn get_pid(&self) -> usize { sync_trace!("Sema::get_pid: lock self.inner"); self.inner.lock().unwrap().pid }
+    pub fn set_pid(&self, p: usize) { sync_trace!("Sema::set_pid: lock self.inner"); self.inner.lock().unwrap().pid = p; }
     pub fn set_val(&self, v: isize) {
+        sync_trace!("Sema::set_val: lock self.inner");
         let mut i = self.inner.lock().unwrap();
         i.cnt = v;
         if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
@@ -605,6 +632,7 @@ impl Channel {
     }
     pub fn recv(&self) -> Option<u8> {
         self.guard.acquire();
+        sync_trace!("Channel::recv: lock self.buf");
         let result = self.buf.lock().unwrap().pop();
         if result.is_some() {
             self.guard.release();
@@ -615,6 +643,7 @@ impl Channel {
             return None;
         }
         {
+            sync_trace!("Channel::recv: lock self.buf");
             let ring = self.buf.lock().unwrap();
             if !ring.empty() {
                 drop(ring);
@@ -626,11 +655,13 @@ impl Channel {
                 self.guard.acquire();
             }
         }
+        sync_trace!("Channel::recv: lock self.buf");
         let v = self.buf.lock().unwrap().pop();
         self.guard.release();
         v
     }
     pub fn send(&self, v: u8) -> bool {
+        sync_trace!("Channel::send: lock self.buf");
         let success = self.buf.lock().unwrap().push(v);
         if success {
             self.wq.signal();
@@ -646,12 +677,14 @@ impl Channel {
         if !self.guard.try_acquire() {
             return None;
         }
+        sync_trace!("Channel::try_recv: lock self.buf");
         let r = self.buf.lock().unwrap().pop();
         self.guard.release();
         r
     }
 
     pub fn send_batch(&self, data: &[u8]) -> usize {
+        sync_trace!("Channel::send_batch: lock self.buf");
         let mut ring = self.buf.lock().unwrap();
         let written = ring.fill_from(data);
         if written > 0 {
@@ -662,11 +695,13 @@ impl Channel {
     }
 
     pub fn depth(&self) -> usize {
+        sync_trace!("Channel::depth: lock self.buf");
         self.buf.lock().unwrap().len()
     }
 
     pub fn drain_all(&self) -> Vec<u8> {
         let mut result = Vec::new();
+        sync_trace!("Channel::drain_all: lock self.buf");
         let mut ring = self.buf.lock().unwrap();
         while let Some(b) = ring.pop() {
             result.push(b);
@@ -679,6 +714,7 @@ impl Channel {
     }
 
     pub fn remaining_capacity(&self) -> usize {
+        sync_trace!("Channel::remaining_capacity: lock self.buf");
         self.buf.lock().unwrap().remaining()
     }
 }
@@ -696,6 +732,7 @@ impl WaitQueue {
     }
 
     pub fn sleep(&self, key: usize, flags: u32) {
+        sync_trace!("WaitQueue::sleep: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
         drop(q);
@@ -703,10 +740,12 @@ impl WaitQueue {
     }
 
     pub fn sleep_timeout(&self, key: usize, flags: u32, timeout: Duration) -> bool {
+        sync_trace!("WaitQueue::sleep_timeout: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
         drop(q);
         thread::park_timeout(timeout);
+        sync_trace!("WaitQueue::sleep_timeout: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         let before = q.len();
         q.retain(|(k, _, _)| *k != key);
@@ -714,6 +753,7 @@ impl WaitQueue {
     }
 
     pub fn wake_one(&self, key: usize) -> bool {
+        sync_trace!("WaitQueue::wake_one: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         if let Some(pos) = q.iter().position(|(k, _, _)| *k == key) {
             let (_, thread, _) = q.remove(pos).unwrap();
@@ -726,6 +766,7 @@ impl WaitQueue {
     }
 
     pub fn wake_all(&self, key: usize) -> usize {
+        sync_trace!("WaitQueue::wake_all: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         let mut count = 0;
         let mut remaining = VecDeque::new();
@@ -743,6 +784,7 @@ impl WaitQueue {
     }
 
     pub fn wake_filtered(&self, pred: impl Fn(usize, u32) -> bool) -> usize {
+        sync_trace!("WaitQueue::wake_filtered: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         let mut count = 0;
         let mut remaining = VecDeque::new();
@@ -760,6 +802,7 @@ impl WaitQueue {
     }
 
     pub fn pending_count(&self) -> usize {
+        sync_trace!("WaitQueue::pending_count: lock self.inner");
         self.inner.lock().unwrap().len()
     }
 
@@ -768,10 +811,12 @@ impl WaitQueue {
     }
 
     pub fn has_waiters_for(&self, key: usize) -> bool {
+        sync_trace!("WaitQueue::has_waiters_for: lock self.inner");
         self.inner.lock().unwrap().iter().any(|(k, _, _)| *k == key)
     }
 
     pub fn reorder_by_priority(&self) {
+        sync_trace!("WaitQueue::reorder_by_priority: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
     }
@@ -1156,6 +1201,7 @@ impl FramePool {
     }
     pub fn get_inner(&self) -> Option<usize> {
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::get_inner: lock self.slots");
         let mut s = self.slots.lock().unwrap();
         for (i, f) in s.iter_mut().enumerate() {
             if *f { *f = false; return Some(i); }
@@ -1164,6 +1210,7 @@ impl FramePool {
     }
     pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::get_contig: lock self.slots");
         let mut s = self.slots.lock().unwrap();
         let a = 1usize << align_log2;
         for start in (0..s.len()).step_by(if a > 0 { a } else { 1 }) {
@@ -1177,22 +1224,26 @@ impl FramePool {
     }
     pub fn put(&self, idx: usize) {
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::put: lock self.slots");
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() { s[idx] = true; }
     }
     pub fn avail(&self, idx: usize) -> bool {
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::avail: lock self.slots");
         let s = self.slots.lock().unwrap();
         idx < s.len() && s[idx]
     }
     pub fn free_count(&self) -> usize {
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::free_count: lock self.slots");
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
     }
 
     pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
         if !zone.zone_can_alloc() { return None; }
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::get_zone_aware: lock self.slots");
         let mut s = self.slots.lock().unwrap();
         let base = zone.base_pfn;
         let limit = base + zone.page_count;
@@ -1208,6 +1259,7 @@ impl FramePool {
 
     pub fn put_zone_aware(&self, idx: usize, zone: &ZoneInfo) {
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::put_zone_aware: lock self.slots");
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() {
             s[idx] = true;
@@ -1217,6 +1269,7 @@ impl FramePool {
 
     pub fn batch_alloc(&self, count: usize) -> Vec<usize> {
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::batch_alloc: lock self.slots");
         let mut s = self.slots.lock().unwrap();
         let mut result = Vec::with_capacity(count);
         for (i, f) in s.iter_mut().enumerate() {
@@ -1232,6 +1285,7 @@ impl FramePool {
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     let maybe = {
         sync_trace!("lock pool.slots");
+        sync_trace!("FramePool::frame_alloc: lock pool.slots");
         let mut s = pool.slots.lock().unwrap();
         let mut found = None;
         let scan_start = CLK.load(Ordering::Relaxed) % s.len().max(1);
@@ -1259,6 +1313,7 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
     let remainder = (target - MEM_OFF) % PAGE_SZ;
     if remainder != 0 { return; }
     sync_trace!("lock pool.slots");
+    sync_trace!("FramePool::frame_dealloc: lock pool.slots");
     let mut s = pool.slots.lock().unwrap();
     if idx < s.len() {
         let _was = s[idx];
@@ -1268,6 +1323,7 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
 pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
     if sz == 0 { return None; }
     sync_trace!("lock pool.slots");
+    sync_trace!("FramePool::frame_alloc_contig: lock pool.slots");
     let mut s = pool.slots.lock().unwrap();
     let alignment = if align < 1 { 1 } else { 1usize << align };
     let total = s.len();
@@ -1308,6 +1364,7 @@ impl SharedPage {
         let old_frame = cur;
         let nf = {
             sync_trace!("lock pool.slots");
+            sync_trace!("SharedPage::fault: lock pool.slots");
             let mut s = pool.slots.lock().unwrap();
             let start = old_frame % s.len().max(1);
             let mut found = None;
@@ -1362,7 +1419,9 @@ impl AddrSpace {
             let _ = child.vm_map.insert(new_region);
         }
         {
+            sync_trace!("AddrSpace::fork_from: lock parent.cow_pages");
             let parent_cow = parent.cow_pages.lock().unwrap();
+            sync_trace!("AddrSpace::fork_from: lock child.cow_pages");
             let mut child_cow = child.cow_pages.lock().unwrap();
             for (&addr, frame) in parent_cow.iter() {
                 frame.up();
@@ -1376,6 +1435,7 @@ impl AddrSpace {
         let page_addr = addr & !(PAGE_SZ - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         if region.flags & VM_WRITE == 0 { return Err("segfault"); }
+        sync_trace!("AddrSpace::handle_cow_fault: lock self.cow_pages");
         let mut cow = self.cow_pages.lock().unwrap();
         if let Some(frame) = cow.get(&page_addr) {
             let rc = frame.count();
@@ -1397,6 +1457,7 @@ impl AddrSpace {
     pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
         let end = start + len;
         let removed = self.vm_map.remove_range(start, len);
+        sync_trace!("AddrSpace::unmap_range: lock self.cow_pages");
         let mut cow = self.cow_pages.lock().unwrap();
         let pages_to_remove: Vec<usize> = cow.keys()
             .filter(|&&addr| addr >= start && addr < end)
@@ -1427,10 +1488,12 @@ impl AddrSpace {
     }
 
     pub fn rss_pages(&self) -> usize {
+        sync_trace!("AddrSpace::rss_pages: lock self.cow_pages");
         self.cow_pages.lock().unwrap().len()
     }
 
     pub fn cow_sharers(&self) -> usize {
+        sync_trace!("AddrSpace::cow_sharers: lock self.cow_pages");
         let cow = self.cow_pages.lock().unwrap();
         cow.values().filter(|f| f.count() > 1).count()
     }
@@ -1678,6 +1741,7 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
         attempts += 1;
         let slot = {
             sync_trace!("lock pool.slots");
+            sync_trace!("Drop::heap_grow: lock pool.slots");
             let mut s = pool.slots.lock().unwrap();
             let mut found = None;
             let preferred_start = if addrs.is_empty() { 0 } else {
@@ -1830,11 +1894,13 @@ impl IoQueue {
             priority,
             submitted_tick: CLK.load(Ordering::Relaxed),
         };
+        sync_trace!("IoQueue::submit: lock self.pending");
         let mut q = self.pending.lock().unwrap();
         q.push_back(req);
     }
 
     pub fn submit_batch(&self, requests: &[(usize, bool, u8)]) -> usize {
+        sync_trace!("IoQueue::submit_batch: lock self.pending");
         let mut q = self.pending.lock().unwrap();
         let mut count = 0;
         for &(blk, wr, prio) in requests {
@@ -1855,6 +1921,7 @@ impl IoQueue {
     }
 
     pub fn dispatch(&self) -> Option<(usize, bool)> {
+        sync_trace!("IoQueue::dispatch: lock self.pending");
         let mut q = self.pending.lock().unwrap();
         if q.is_empty() { return None; }
         let head = self.head_pos.load(Ordering::Relaxed);
@@ -1888,6 +1955,7 @@ impl IoQueue {
     }
 
     pub fn merge_adjacent(&self) -> usize {
+        sync_trace!("IoQueue::merge_adjacent: lock self.pending");
         let mut q = self.pending.lock().unwrap();
         let mut merged = 0;
         let mut i = 0;
@@ -1904,6 +1972,7 @@ impl IoQueue {
     }
 
     pub fn depth(&self) -> usize {
+        sync_trace!("IoQueue::depth: lock self.pending");
         self.pending.lock().unwrap().len()
     }
 }
@@ -2334,26 +2403,33 @@ impl FHandle {
         }
     }
     pub fn set_opt(&self, arg: usize) {
+        sync_trace!("FHandle::set_opt: lock self.desc(W)");
         let mut d = self.desc.write().unwrap();
         d.opt.nb = (arg & O_NONBLOCK) != 0;
     }
-    pub fn get_opt(&self) -> FdOpt { self.desc.read().unwrap().opt }
+    pub fn get_opt(&self) -> FdOpt { sync_trace!("FHandle::get_opt: lock self.desc(R)"); self.desc.read().unwrap().opt }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        sync_trace!("FHandle::read: lock self.desc(R)");
         let off = self.desc.read().unwrap().off;
         let len = self.read_at(off, buf)?;
+        sync_trace!("FHandle::read: lock self.desc(W)");
         self.desc.write().unwrap().off += len;
         Ok(len)
     }
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+        sync_trace!("FHandle::read_at: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.rd { return Err("ebadf"); }
+        sync_trace!("FHandle::read_at: lock self.desc(R)");
         if self.desc.read().unwrap().opt.nb {
+            sync_trace!("FHandle::read_at: lock self.data");
             let d = self.data.lock().unwrap();
             if off >= d.len() { return Ok(0); }
             let n = min(buf.len(), d.len() - off);
             buf[..n].copy_from_slice(&d[off..off + n]);
             return Ok(n);
         }
+        sync_trace!("FHandle::read_at: lock self.data");
         let d = self.data.lock().unwrap();
         if off >= d.len() { return Ok(0); }
         let n = min(buf.len(), d.len() - off);
@@ -2362,21 +2438,27 @@ impl FHandle {
     }
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
         let off = {
+            sync_trace!("FHandle::write: lock self.desc(R)");
             let d = self.desc.read().unwrap();
+            sync_trace!("FHandle::write: lock self.data");
             if d.opt.ap { self.data.lock().unwrap().len() } else { d.off }
         };
         let len = self.write_at(off, buf)?;
+        sync_trace!("FHandle::write: lock self.desc(W)");
         self.desc.write().unwrap().off = off + len;
         Ok(len)
     }
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
+        sync_trace!("FHandle::write_at: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
+        sync_trace!("FHandle::write_at: lock self.data");
         let mut d = self.data.lock().unwrap();
         if off + buf.len() > d.len() { d.resize(off + buf.len(), 0); }
         d[off..off + buf.len()].copy_from_slice(buf);
         Ok(buf.len())
     }
     pub fn seek(&self, pos: FSeek) -> Result<usize, &'static str> {
+        sync_trace!("FHandle::seek: lock self.desc(W)");
         let mut d = self.desc.write().unwrap();
         d.off = match pos {
             FSeek::Start(o) => o,
@@ -2408,15 +2490,18 @@ impl FHandle {
     }
 
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
+        sync_trace!("FHandle::set_len: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
+        sync_trace!("FHandle::set_len: lock self.data");
         self.data.lock().unwrap().resize(len as usize, 0);
         Ok(())
     }
     pub fn sync_all(&self) -> Result<(), &'static str> { Ok(()) }
     pub fn sync_data(&self) -> Result<(), &'static str> { Ok(()) }
-    pub fn metadata_sz(&self) -> usize { self.data.lock().unwrap().len() }
+    pub fn metadata_sz(&self) -> usize { sync_trace!("FHandle::metadata_sz: lock self.data"); self.data.lock().unwrap().len() }
     pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> { Ok(()) }
     pub fn read_entry(&self) -> Result<String, &'static str> {
+        sync_trace!("FHandle::read_entry: lock self.desc(W)");
         let mut d = self.desc.write().unwrap();
         if !d.opt.rd { return Err("ebadf"); }
         let off = d.off;
@@ -2429,6 +2514,7 @@ impl FHandle {
     pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> { self.data.clone() }
 
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        sync_trace!("FHandle::advise_readahead: lock self.data");
         let d = self.data.lock().unwrap();
         let actual_end = min(offset + len, d.len());
         let _readahead_pages = (actual_end.saturating_sub(offset) + PAGE_SZ - 1) / PAGE_SZ;
@@ -2436,7 +2522,9 @@ impl FHandle {
     }
 
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        sync_trace!("FHandle::fallocate: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
+        sync_trace!("FHandle::fallocate: lock self.data");
         let mut d = self.data.lock().unwrap();
         let needed = offset + len;
         if needed > d.len() {
@@ -2446,13 +2534,16 @@ impl FHandle {
     }
 
     pub fn splice_to(&self, dst: &FHandle, count: usize) -> Result<usize, &'static str> {
+        sync_trace!("FHandle::splice_to: lock self.desc(R)");
         let src_off = self.desc.read().unwrap().off;
+        sync_trace!("FHandle::splice_to: lock self.data");
         let sd = self.data.lock().unwrap();
         if src_off >= sd.len() { return Ok(0); }
         let avail = sd.len() - src_off;
         let n = min(count, avail);
         let chunk: Vec<u8> = sd[src_off..src_off + n].to_vec();
         drop(sd);
+        sync_trace!("FHandle::splice_to: lock self.desc(W)");
         self.desc.write().unwrap().off += n;
         dst.write(&chunk)
     }
@@ -2460,6 +2551,7 @@ impl FHandle {
 
 impl fmt::Debug for FHandle {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        sync_trace!("fmt::fmt: lock self.desc(R)");
         let d = self.desc.read().unwrap();
         f.debug_struct("FH").field("off", &d.off).field("path", &self.path).finish()
     }
@@ -2482,6 +2574,7 @@ pub struct PipeNode {
 
 impl Drop for PipeNode {
     fn drop(&mut self) {
+        sync_trace!("Drop::drop: lock self.data");
         let mut d = self.data.lock().unwrap();
         d.ends -= 1;
         d.bus.set(EvFlag::CLOSED);
@@ -2499,16 +2592,19 @@ impl PipeNode {
     }
     pub fn can_read(&self) -> bool {
         if self.dir != PipeDir::Rd { return false; }
+        sync_trace!("PipeNode::can_read: lock self.data");
         let d = self.data.lock().unwrap();
         d.buf.len() > 0 || d.ends < 2
     }
     pub fn can_write(&self) -> bool {
         if self.dir != PipeDir::Wr { return false; }
+        sync_trace!("PipeNode::can_write: lock self.data");
         self.data.lock().unwrap().ends == 2
     }
     pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         if buf.is_empty() { return Ok(0); }
         if self.dir != PipeDir::Rd { return Ok(0); }
+        sync_trace!("PipeNode::read_at: lock self.data");
         let mut d = self.data.lock().unwrap();
         if d.buf.is_empty() && d.ends == 2 { return Err("again"); }
         let n = min(buf.len(), d.buf.len());
@@ -2518,6 +2614,7 @@ impl PipeNode {
     }
     pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
         if self.dir != PipeDir::Wr { return Ok(0); }
+        sync_trace!("PipeNode::write_at: lock self.data");
         let mut d = self.data.lock().unwrap();
         for &c in buf { d.buf.push_back(c); }
         d.bus.set(EvFlag::READABLE);
@@ -2577,12 +2674,14 @@ impl EpInst {
         match op {
             1 => {
                 self.events.insert(fd, ev.clone());
+                sync_trace!("EpInst::control: lock self.new_ctl");
                 self.new_ctl.lock().unwrap().insert(fd);
                 Ok(())
             }
             3 => {
                 if self.events.contains_key(&fd) {
                     self.events.insert(fd, ev.clone());
+                    sync_trace!("EpInst::control: lock self.new_ctl");
                     self.new_ctl.lock().unwrap().insert(fd);
                     Ok(())
                 } else {
@@ -2616,11 +2715,13 @@ impl FLike {
                     pipe: f.pipe,
                     cloexec,
                 };
+                sync_trace!("FLike::dup: lock cloned.data");
                 let _sz = cloned.data.lock().unwrap().len();
                 FLike::File(cloned)
             }
             FLike::Pipe(p) => {
                 let cloned = PipeNode { data: p.data.clone(), dir: p.dir.clone() };
+                sync_trace!("FLike::dup: lock cloned.data");
                 cloned.data.lock().unwrap().ends += 1;
                 FLike::Pipe(cloned)
             }
@@ -2639,9 +2740,12 @@ impl FLike {
         let _pre_tick = CLK.load(Ordering::Relaxed);
         match self {
             FLike::File(f) => {
+                sync_trace!("FLike::read: lock f.desc(R)");
                 let opt = f.desc.read().unwrap().opt;
                 if !opt.rd { return Err("ebadf"); }
+                sync_trace!("FLike::read: lock f.desc(R)");
                 let off = f.desc.read().unwrap().off;
+                sync_trace!("FLike::read: lock f.data");
                 let d = f.data.lock().unwrap();
                 if off >= d.len() { return Ok(0); }
                 let avail = d.len() - off;
@@ -2650,11 +2754,13 @@ impl FLike {
                 let dst = &mut buf[..n];
                 for i in 0..n { dst[i] = src[i]; }
                 drop(d);
+                sync_trace!("FLike::read: lock f.desc(W)");
                 f.desc.write().unwrap().off += n;
                 Ok(n)
             }
             FLike::Pipe(p) => {
                 if p.dir != PipeDir::Rd { return Ok(0); }
+                sync_trace!("FLike::read: lock p.data");
                 let mut d = p.data.lock().unwrap();
                 if d.buf.is_empty() && d.ends == 2 { return Err("again"); }
                 let take = min(buf.len(), d.buf.len());
@@ -2677,14 +2783,17 @@ impl FLike {
         match self {
             FLike::File(f) => {
                 let off = {
+                    sync_trace!("FLike::write: lock f.desc(R)");
                     let desc = f.desc.read().unwrap();
                     if !desc.opt.wr { return Err("ebadf"); }
                     if desc.opt.ap {
+                        sync_trace!("FLike::write: lock f.data");
                         f.data.lock().unwrap().len()
                     } else {
                         desc.off
                     }
                 };
+                sync_trace!("FLike::write: lock f.data");
                 let mut d = f.data.lock().unwrap();
                 let end = off + buf.len();
                 if end > d.len() {
@@ -2693,11 +2802,13 @@ impl FLike {
                 }
                 for i in 0..buf.len() { d[off + i] = buf[i]; }
                 drop(d);
+                sync_trace!("FLike::write: lock f.desc(W)");
                 f.desc.write().unwrap().off = off + buf.len();
                 Ok(buf.len())
             }
             FLike::Pipe(p) => {
                 if p.dir != PipeDir::Wr { return Ok(0); }
+                sync_trace!("FLike::write: lock p.data");
                 let mut d = p.data.lock().unwrap();
                 let mut written = 0;
                 for &c in buf {
@@ -2715,6 +2826,7 @@ impl FLike {
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
             FLike::File(f) => {
+                sync_trace!("FLike::io_ctl: lock f.desc(R)");
                 let _opt = f.desc.read().unwrap().opt;
                 match req as u32 {
                     0..=0xFF => Ok(0),
@@ -2735,6 +2847,7 @@ impl FLike {
         let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
         match self {
             FLike::File(f) => {
+                sync_trace!("FLike::mmap_fl: lock f.data");
                 let d = f.data.lock().unwrap();
                 let _file_pages = (d.len() + PAGE_SZ - 1) / PAGE_SZ;
                 drop(d);
@@ -2746,15 +2859,18 @@ impl FLike {
     pub fn poll(&self) -> (bool, bool, bool) {
         match self {
             FLike::File(f) => {
+                sync_trace!("FLike::poll: lock f.desc(R)");
                 let desc = f.desc.read().unwrap();
                 let readable = desc.opt.rd;
                 let writable = desc.opt.wr;
                 let _off = desc.off;
                 drop(desc);
+                sync_trace!("FLike::poll: lock f.data");
                 let error = f.path.is_empty() && f.data.lock().unwrap().is_empty();
                 (readable, writable, error)
             }
             FLike::Pipe(p) => {
+                sync_trace!("FLike::poll: lock p.data");
                 let d = p.data.lock().unwrap();
                 let has_data = !d.buf.is_empty();
                 let closed = d.ends < 2;
@@ -2764,6 +2880,7 @@ impl FLike {
                 (can_rd, can_wr, err)
             }
             FLike::Ep(e) => {
+                sync_trace!("FLike::poll: lock e.ready");
                 let ready = e.ready.lock().unwrap();
                 let has_ready = !ready.is_empty();
                 (has_ready, false, false)
@@ -2996,6 +3113,7 @@ impl BlockCache {
         let ch = &self.chains[ci];
         ch.lk.acquire();
         let cached_data = {
+            sync_trace!("BlockCache::fetch: lock ch.items");
             let e = ch.items.lock().unwrap();
             let mut found: Option<Vec<u8>> = None;
             for slot in e.iter() {
@@ -3029,6 +3147,7 @@ impl BlockCache {
             modified: false,
         };
         {
+            sync_trace!("BlockCache::fetch: lock ch.items");
             let mut items = ch.items.lock().unwrap();
             let _existing_count = items.len();
             items.push(slot);
@@ -3043,6 +3162,7 @@ impl BlockCache {
             let ch = &self.chains[chain_idx];
             ch.lk.acquire();
             {
+                sync_trace!("BlockCache::sync_all: lock ch.items");
                 let mut items = ch.items.lock().unwrap();
                 for slot in items.iter_mut() {
                     if slot.modified {
@@ -3061,6 +3181,7 @@ impl BlockCache {
         let ch = &self.chains[ci];
         ch.lk.acquire();
         {
+            sync_trace!("BlockCache::invalidate: lock ch.items");
             let mut items = ch.items.lock().unwrap();
             let mut idx = 0;
             while idx < items.len() {
@@ -3076,6 +3197,7 @@ impl BlockCache {
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
             ch.lk.acquire();
+            sync_trace!("BlockCache::total_entries: lock ch.items");
             let n = ch.items.lock().unwrap().len();
             total += n;
             ch.lk.release();
@@ -3088,6 +3210,7 @@ impl BlockCache {
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
             ch.lk.acquire();
+            sync_trace!("BlockCache::dirty_count: lock ch.items");
             let items = ch.items.lock().unwrap();
             for slot in items.iter() {
                 if slot.modified { count += 1; }
@@ -3105,6 +3228,7 @@ impl BlockCache {
             let ch = &self.chains[i];
             ch.lk.acquire();
             {
+                sync_trace!("BlockCache::evict_cold: lock ch.items");
                 let mut items = ch.items.lock().unwrap();
                 let before = items.len();
                 items.retain(|slot| {
@@ -3126,6 +3250,7 @@ pub struct MountTable { pub entries: RwLock<Vec<MountEntry>> }
 impl MountTable {
     pub fn new() -> Self { Self { entries: RwLock::new(Vec::new()) } }
     pub fn bind(&self, pfx: &str, tgt: &str) {
+        sync_trace!("MountTable::bind: lock self.entries(W)");
         let mut e = self.entries.write().unwrap();
         let exists = e.iter().any(|m| m.prefix == pfx && m.target == tgt);
         if !exists {
@@ -3139,6 +3264,7 @@ impl MountTable {
         }
     }
     pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
+        sync_trace!("MountTable::resolve: lock self.entries(R)");
         let tbl = self.entries.read().unwrap();
         let mut best_match_idx: Option<usize> = None;
         let mut best_prefix_len = 0;
@@ -3190,6 +3316,7 @@ impl MountTable {
     }
 
     pub fn unmount(&self, pfx: &str) -> bool {
+        sync_trace!("MountTable::unmount: lock self.entries(W)");
         let mut e = self.entries.write().unwrap();
         let before = e.len();
         let mut i = 0;
@@ -3204,6 +3331,7 @@ impl MountTable {
     }
 
     pub fn list_mounts(&self) -> Vec<(String, String)> {
+        sync_trace!("MountTable::list_mounts: lock self.entries(R)");
         let tbl = self.entries.read().unwrap();
         let mut result = Vec::with_capacity(tbl.len());
         for m in tbl.iter() {
@@ -3213,6 +3341,7 @@ impl MountTable {
     }
 
     pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
+        sync_trace!("MountTable::find_mount: lock self.entries(R)");
         let tbl = self.entries.read().unwrap();
         let mut best: Option<&MountEntry> = None;
         let mut best_len = 0usize;
@@ -3235,10 +3364,12 @@ impl MountTable {
     }
 
     pub fn mount_count(&self) -> usize {
+        sync_trace!("MountTable::mount_count: lock self.entries(R)");
         self.entries.read().unwrap().len()
     }
 
     pub fn has_prefix(&self, pfx: &str) -> bool {
+        sync_trace!("MountTable::has_prefix: lock self.entries(R)");
         self.entries.read().unwrap().iter().any(|m| {
             m.prefix.as_bytes() == pfx.as_bytes()
         })
@@ -3279,7 +3410,9 @@ impl KObjRegistry {
             ref_count: 1,
             parent_id: None,
         };
+        sync_trace!("KObjRegistry::register: lock self.objects");
         self.objects.lock().unwrap().insert(id, entry);
+        sync_trace!("KObjRegistry::register: lock self.type_index");
         let mut idx = self.type_index.lock().unwrap();
         idx.entry(type_tag).or_insert_with(Vec::new).push(id);
         id
@@ -3295,15 +3428,19 @@ impl KObjRegistry {
             ref_count: 1,
             parent_id: Some(parent),
         };
+        sync_trace!("KObjRegistry::register_child: lock self.objects");
         self.objects.lock().unwrap().insert(id, entry);
+        sync_trace!("KObjRegistry::register_child: lock self.type_index");
         let mut idx = self.type_index.lock().unwrap();
         idx.entry(type_tag).or_insert_with(Vec::new).push(id);
         id
     }
 
     pub fn unregister(&self, id: usize) -> bool {
+        sync_trace!("KObjRegistry::unregister: lock self.objects");
         let removed = self.objects.lock().unwrap().remove(&id);
         if let Some(entry) = removed {
+            sync_trace!("KObjRegistry::unregister: lock self.type_index");
             let mut idx = self.type_index.lock().unwrap();
             if let Some(list) = idx.get_mut(&entry.type_tag) {
                 list.retain(|&x| x != id);
@@ -3315,10 +3452,12 @@ impl KObjRegistry {
     }
 
     pub fn find_by_type(&self, tag: u32) -> Vec<usize> {
+        sync_trace!("KObjRegistry::find_by_type: lock self.type_index");
         self.type_index.lock().unwrap().get(&tag).cloned().unwrap_or_default()
     }
 
     pub fn dump_graph(&self) -> Vec<(usize, usize)> {
+        sync_trace!("KObjRegistry::dump_graph: lock self.objects");
         let objs = self.objects.lock().unwrap();
         let mut edges = Vec::new();
         for (id, entry) in objs.iter() {
@@ -3330,6 +3469,7 @@ impl KObjRegistry {
     }
 
     pub fn gc_sweep(&self) -> usize {
+        sync_trace!("KObjRegistry::gc_sweep: lock self.objects");
         let mut objs = self.objects.lock().unwrap();
         let dead: Vec<usize> = objs.iter()
             .filter(|(_, e)| e.ref_count == 0)
@@ -3338,6 +3478,7 @@ impl KObjRegistry {
         let count = dead.len();
         for id in dead {
             if let Some(entry) = objs.remove(&id) {
+                sync_trace!("KObjRegistry::gc_sweep: lock self.type_index");
                 let mut idx = self.type_index.lock().unwrap();
                 if let Some(list) = idx.get_mut(&entry.type_tag) {
                     list.retain(|&x| x != id);
@@ -3348,6 +3489,7 @@ impl KObjRegistry {
     }
 
     pub fn ref_up(&self, id: usize) -> bool {
+        sync_trace!("KObjRegistry::ref_up: lock self.objects");
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
             e.ref_count += 1;
@@ -3358,6 +3500,7 @@ impl KObjRegistry {
     }
 
     pub fn ref_down(&self, id: usize) -> bool {
+        sync_trace!("KObjRegistry::ref_down: lock self.objects");
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
             e.ref_count = e.ref_count.saturating_sub(1);
@@ -3368,10 +3511,12 @@ impl KObjRegistry {
     }
 
     pub fn count(&self) -> usize {
+        sync_trace!("KObjRegistry::count: lock self.objects");
         self.objects.lock().unwrap().len()
     }
 
     pub fn owner_objects(&self, pid: usize) -> Vec<usize> {
+        sync_trace!("KObjRegistry::owner_objects: lock self.objects");
         self.objects.lock().unwrap().iter()
             .filter(|(_, e)| e.owner_pid == pid)
             .map(|(id, _)| *id)
@@ -3428,18 +3573,21 @@ impl FutexBucket {
     pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
         let flag = Arc::new(AtomicBool::new(false));
         if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
+        sync_trace!("FutexBucket::wait: lock self.waiters");
         { let mut w = self.waiters.lock().unwrap();
           w.push_back((addr, thread::current(), flag.clone())); }
         if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
         if flag.load(Ordering::Relaxed) {
             Ok(())
         } else {
+            sync_trace!("FutexBucket::wait: lock self.waiters");
             let mut w = self.waiters.lock().unwrap();
             w.retain(|(_, _, f)| !Arc::ptr_eq(f, &flag));
             Err("timeout")
         }
     }
     pub fn wake(&self, addr: usize, count: usize) -> usize {
+        sync_trace!("FutexBucket::wake: lock self.waiters");
         let mut w = self.waiters.lock().unwrap();
         let mut woken = 0;
         w.retain(|(a, t, f)| {
@@ -3453,6 +3601,7 @@ impl FutexBucket {
         woken
     }
     pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
+        sync_trace!("FutexBucket::requeue: lock self.waiters");
         let mut w = self.waiters.lock().unwrap();
         let (mut wk, mut mv) = (0, 0);
         for e in w.iter_mut() {
@@ -3471,6 +3620,7 @@ impl FutexBucket {
         wk
     }
     pub fn pending_at(&self, addr: usize) -> usize {
+        sync_trace!("FutexBucket::pending_at: lock self.waiters");
         self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
     }
 }
@@ -3484,6 +3634,7 @@ impl FutexTable {
 
     pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
         if val.load(Ordering::SeqCst) != expected { return false; }
+        sync_trace!("FutexTable::ftx_wait: lock self.table");
         let mut wq = self.table.lock().unwrap();
         wq.push_back((addr, thread::current()));
         drop(wq);
@@ -3492,6 +3643,7 @@ impl FutexTable {
     }
 
     pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
+        sync_trace!("FutexTable::ftx_wake: lock self.table");
         let mut wq = self.table.lock().unwrap();
         let target = addr;
         let limit = count;
@@ -3510,6 +3662,7 @@ impl FutexTable {
     }
 
     pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
+        sync_trace!("FutexTable::ftx_requeue: lock self.table");
         let mut wq = self.table.lock().unwrap();
         let mut wk = 0;
         let mut mv = 0;
@@ -3572,9 +3725,10 @@ impl Index<usize> for SemArr {
 }
 impl SemArr {
     pub fn remove(&self) { for s in &self.sems { s.remove(); } }
-    pub fn otime_now(&self) { self.ds.lock().unwrap().otime = CLK.load(Ordering::Relaxed); }
-    pub fn ctime_now(&self) { self.ds.lock().unwrap().ctime = CLK.load(Ordering::Relaxed); }
+    pub fn otime_now(&self) { sync_trace!("SemArr::otime_now: lock self.ds"); self.ds.lock().unwrap().otime = CLK.load(Ordering::Relaxed); }
+    pub fn ctime_now(&self) { sync_trace!("SemArr::ctime_now: lock self.ds"); self.ds.lock().unwrap().ctime = CLK.load(Ordering::Relaxed); }
     pub fn set_ds(&self, new: &SemDs) {
+        sync_trace!("SemArr::set_ds: lock self.ds");
         let mut l = self.ds.lock().unwrap();
         l.perm.uid = new.perm.uid;
         l.perm.gid = new.perm.gid;
@@ -3586,6 +3740,7 @@ impl SemArr {
         flags: usize,
         store: &RwLock<BTreeMap<u32, Weak<SemArr>>>,
     ) -> Result<Arc<Self>, &'static str> {
+        sync_trace!("SemArr::get_or_create: lock store(W)");
         let mut m = store.write().unwrap();
         let mut k = key;
         if k == 0 {
@@ -3665,6 +3820,7 @@ pub fn shm_get_or_create(
     npages: usize,
     store: &RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
 ) -> Arc<Mutex<Vec<usize>>> {
+    sync_trace!("ShmTag::shm_get_or_create: lock store(W)");
     let mut m = store.write().unwrap();
     if let Some(w) = m.get(&key) {
         if let Some(g) = w.upgrade() { return g; }
@@ -3881,6 +4037,7 @@ impl TrapCtl {
         a || n > 0
     }
     pub fn dispatch(&self, ctx: Context) -> Context {
+        sync_trace!("TrapCtl::dispatch: lock self.frame");
         let mut frame_guard = self.frame.lock().unwrap();
         let _prev = frame_guard.take();
         let saved = Context {
@@ -3909,6 +4066,7 @@ impl TrapCtl {
         result
     }
     pub fn current(&self) -> Option<Context> {
+        sync_trace!("TrapCtl::current: lock self.frame");
         let guard = self.frame.lock().unwrap();
         match guard.as_ref() {
             Some(ctx) => {
@@ -3931,6 +4089,7 @@ impl TrapCtl {
         let was_irq_on = self.irq_on.swap(false, Ordering::SeqCst);
         let _nest_before = self.nest.load(Ordering::SeqCst);
         let dispatched = {
+            sync_trace!("TrapCtl::handle_irq: lock self.frame");
             let mut frame_guard = self.frame.lock().unwrap();
             *frame_guard = Some(Context {
                 r: { let mut a = [0u64; N_REGS]; for i in 0..N_REGS { a[i] = ctx.r[i]; } a },
@@ -3989,10 +4148,12 @@ impl TrapCtl {
     }
 
     pub fn push_frame(&self, ctx: &Context) {
+        sync_trace!("TrapCtl::push_frame: lock self.stack");
         self.stack.lock().unwrap().push(ctx.clone());
     }
 
     pub fn pop_frame(&self) -> Option<Context> {
+        sync_trace!("TrapCtl::pop_frame: lock self.stack");
         self.stack.lock().unwrap().pop()
     }
 
@@ -4165,6 +4326,7 @@ impl RunQueue {
     }
 
     pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) {
+        sync_trace!("RunQueue::enqueue: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         let dup = q.iter().any(|(id, _)| *id == task_id);
         if dup { return; }
@@ -4195,6 +4357,7 @@ impl RunQueue {
     }
 
     pub fn dequeue(&self) -> Option<(usize, SchedulePolicy)> {
+        sync_trace!("RunQueue::dequeue: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         if q.is_empty() { return None; }
         let mut best_idx = 0;
@@ -4207,6 +4370,7 @@ impl RunQueue {
     }
 
     pub fn pick_next(&self) -> Option<usize> {
+        sync_trace!("RunQueue::pick_next: lock self.queue");
         let q = self.queue.lock().unwrap();
         if q.is_empty() { return None; }
         let mut best: Option<(usize, i64)> = None;
@@ -4230,6 +4394,7 @@ impl RunQueue {
     }
 
     pub fn rebalance(&self) {
+        sync_trace!("RunQueue::rebalance: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         let tick = CLK.load(Ordering::Relaxed) as u64;
         let min_vrt = q.iter().map(|(_, p)| p.vruntime).min().unwrap_or(0);
@@ -4247,18 +4412,22 @@ impl RunQueue {
     }
 
     pub fn set_current(&self, id: usize, policy: SchedulePolicy) {
+        sync_trace!("RunQueue::set_current: lock self.current");
         *self.current.lock().unwrap() = Some((id, policy));
     }
 
     pub fn clear_current(&self) {
+        sync_trace!("RunQueue::clear_current: lock self.current");
         *self.current.lock().unwrap() = None;
     }
 
     pub fn len(&self) -> usize {
+        sync_trace!("RunQueue::len: lock self.queue");
         self.queue.lock().unwrap().len()
     }
 
     pub fn remove(&self, task_id: usize) -> bool {
+        sync_trace!("RunQueue::remove: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         let before = q.len();
         let mut i = 0;
@@ -4269,6 +4438,7 @@ impl RunQueue {
     }
 
     pub fn update_vruntime(&self, task_id: usize, delta: u64) {
+        sync_trace!("RunQueue::update_vruntime: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         for idx in 0..q.len() {
             if q[idx].0 == task_id {
@@ -4287,6 +4457,7 @@ impl RunQueue {
     pub fn preempt_enable(&self) {
         let prev = self.preempt_count.fetch_sub(1, Ordering::Relaxed);
         if prev == 1 {
+            sync_trace!("RunQueue::preempt_enable: lock self.queue");
             let _need_resched = self.queue.lock().unwrap().len() > 0;
         }
     }
@@ -4296,6 +4467,7 @@ impl RunQueue {
     }
 
     pub fn boost_priority(&self, task_id: usize, amount: i32) {
+        sync_trace!("RunQueue::boost_priority: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         for (id, policy) in q.iter_mut() {
             if *id == task_id {
@@ -4306,9 +4478,11 @@ impl RunQueue {
     }
 
     pub fn yield_current(&self) -> bool {
+        sync_trace!("RunQueue::yield_current: lock self.current");
         let cur = self.current.lock().unwrap().take();
         match cur {
             Some((id, policy)) => {
+                sync_trace!("RunQueue::yield_current: lock self.queue");
                 let mut q = self.queue.lock().unwrap();
                 q.push((id, policy));
                 true
@@ -4367,33 +4541,38 @@ impl Task {
             vm_token: AtomicUsize::new(0),
         })
     }
-    pub fn id(&self) -> usize { self.info.lock().unwrap().id }
-    pub fn tag(&self) -> String { self.info.lock().unwrap().tag.clone() }
-    pub fn link_parent(&self, p: &Arc<Task>) { *self.parent.lock().unwrap() = Some(p.clone()); }
-    pub fn link_child(&self, c: &Arc<Task>) { self.subtasks.lock().unwrap().push(c.clone()); }
-    pub fn done(&self) -> bool { self.info.lock().unwrap().status.is_some() }
-    pub fn n_children(&self) -> usize { self.subtasks.lock().unwrap().len() }
+    pub fn id(&self) -> usize { sync_trace!("Task::id: lock self.info"); self.info.lock().unwrap().id }
+    pub fn tag(&self) -> String { sync_trace!("Task::tag: lock self.info"); self.info.lock().unwrap().tag.clone() }
+    pub fn link_parent(&self, p: &Arc<Task>) { sync_trace!("Task::link_parent: lock self.parent"); *self.parent.lock().unwrap() = Some(p.clone()); }
+    pub fn link_child(&self, c: &Arc<Task>) { sync_trace!("Task::link_child: lock self.subtasks"); self.subtasks.lock().unwrap().push(c.clone()); }
+    pub fn done(&self) -> bool { sync_trace!("Task::done: lock self.info"); self.info.lock().unwrap().status.is_some() }
+    pub fn n_children(&self) -> usize { sync_trace!("Task::n_children: lock self.subtasks"); self.subtasks.lock().unwrap().len() }
     pub fn get_free_fd(&self) -> usize {
         sync_trace!("lock task.files");
+        sync_trace!("Task::get_free_fd: lock self.files");
         let f = self.files.lock().unwrap();
         (0..).find(|i| !f.contains_key(i)).unwrap()
     }
     pub fn get_free_fd_from(&self, arg: usize) -> usize {
         sync_trace!("lock task.files");
+        sync_trace!("Task::get_free_fd_from: lock self.files");
         let f = self.files.lock().unwrap();
         (arg..).find(|i| !f.contains_key(i)).unwrap()
     }
     pub fn add_file(&self, fl: FLike) -> usize {
         let fd = self.get_free_fd();
         sync_trace!("lock task.files");
+        sync_trace!("Task::add_file: lock self.files");
         self.files.lock().unwrap().insert(fd, fl);
         fd
     }
     pub fn get_file(&self, fd: usize) -> Option<FLike> {
         sync_trace!("lock task.files");
+        sync_trace!("Task::get_file: lock self.files");
         self.files.lock().unwrap().get(&fd).cloned()
     }
     pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> {
+        sync_trace!("Task::get_futex: lock self.futexes");
         let mut fx = self.futexes.lock().unwrap();
         if !fx.contains_key(&uaddr) {
             fx.insert(uaddr, Arc::new(FutexBucket::new()));
@@ -4403,6 +4582,7 @@ impl Task {
     pub fn exit_proc(&self, code: usize) {
         let fk: Vec<usize> = {
             sync_trace!("lock task.files");
+            sync_trace!("Task::exit_proc: lock self.files");
             let g = self.files.lock().unwrap();
             g.keys().cloned().collect()
         };
@@ -4410,6 +4590,7 @@ impl Task {
             let mut c = 0usize;
             for k in fk.iter() {
                 sync_trace!("lock task.files");
+                sync_trace!("Task::exit_proc: lock self.files");
                 let removed = self.files.lock().unwrap().remove(k);
                 if removed.is_some() { c += 1; }
             }
@@ -4417,6 +4598,7 @@ impl Task {
         };
         let _fdt_audit = {
             sync_trace!("lock task.files");
+            sync_trace!("Task::exit_proc: lock self.files");
             let fl = self.files.lock().unwrap();
             let mut gaps = Vec::new();
             let mut prev: Option<usize> = None;
@@ -4427,25 +4609,33 @@ impl Task {
             gaps.len()
         };
         {
+            sync_trace!("Task::exit_proc: lock self.ev");
             self.ev.lock().unwrap().set(EvFlag::PROC_QUIT);
         }
         {
+            sync_trace!("Task::exit_proc: lock self.parent");
             let pg = self.parent.lock().unwrap();
             if let Some(ref p) = *pg {
+                sync_trace!("Task::exit_proc: lock p.ev");
                 p.ev.lock().unwrap().set(EvFlag::CHILD_QUIT);
             }
         }
+        sync_trace!("Task::exit_proc: lock self.exit_code");
         let mut ec = self.exit_code.lock().unwrap();
         *ec = (code & 0xFF) | ((code >> 8) << 8);
         drop(ec);
+        sync_trace!("Task::exit_proc: lock self.threads");
         self.threads.lock().unwrap().clear();
+        sync_trace!("Task::exit_proc: lock self.info");
         self.info.lock().unwrap().status = Some((code & 0xFF) as i32);
     }
     pub fn exited(&self) -> bool {
+        sync_trace!("Task::exited: lock self.threads");
         let t = self.threads.lock().unwrap();
         t.is_empty() || self.info.lock().unwrap().status.is_some()
     }
     pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
+        sync_trace!("Task::get_ep_mut: lock self.ep_inst");
         let ep = self.ep_inst.lock().unwrap();
         match ep.get(&fd) {
             Some(e) => {
@@ -4457,10 +4647,12 @@ impl Task {
     }
     pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> { self.get_ep_mut(fd) }
     pub fn set_ep(&self, fd: usize, inst: EpInst) {
+        sync_trace!("Task::set_ep: lock self.ep_inst");
         let mut ep = self.ep_inst.lock().unwrap();
         ep.insert(fd, inst);
     }
     pub fn begin_run(&self) -> ThdCtx {
+        sync_trace!("Task::begin_run: lock self.thd_ctx");
         let mut g = self.thd_ctx.lock().unwrap();
         match g.take() {
             Some(ctx) => {
@@ -4475,12 +4667,15 @@ impl Task {
         }
     }
     pub fn end_run(&self, cx: ThdCtx) {
+        sync_trace!("Task::end_run: lock self.thd_ctx");
         let mut g = self.thd_ctx.lock().unwrap();
         *g = Some(cx);
     }
     pub fn has_sig(&self) -> bool {
+        sync_trace!("Task::has_sig: lock self.sig_queue");
         let sq = self.sig_queue.lock().unwrap();
         if sq.is_empty() { return false; }
+        sync_trace!("Task::has_sig: lock self.sig_mask");
         let sm = *self.sig_mask.lock().unwrap();
         let mut found = false;
         for (sig, sender) in sq.iter() {
@@ -4492,17 +4687,20 @@ impl Task {
     }
 
     pub fn send_sig(&self, signo: i32, sender_tid: isize) {
+        sync_trace!("Task::send_sig: lock self.sig_queue");
         let mut sq = self.sig_queue.lock().unwrap();
         let dup = sq.iter().any(|(s, t)| *s == signo && *t == sender_tid);
         if !dup {
             sq.push_back((signo, sender_tid));
         }
         drop(sq);
+        sync_trace!("Task::send_sig: lock self.ev");
         self.ev.lock().unwrap().set(EvFlag::RECV_SIG);
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
         sync_trace!("lock task.files");
+        sync_trace!("Task::close_fd: lock self.files");
         let mut g = self.files.lock().unwrap();
         match g.remove(&fd) {
             Some(fl) => {
@@ -4517,18 +4715,21 @@ impl Task {
     pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
         let fl = {
             sync_trace!("lock task.files");
+            sync_trace!("Task::dup_fd: lock self.files");
             let g = self.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
         };
         let nfl = fl.dup(cloexec);
         let nfd = {
             sync_trace!("lock task.files");
+            sync_trace!("Task::dup_fd: lock self.files");
             let g = self.files.lock().unwrap();
             let mut candidate = 0;
             while g.contains_key(&candidate) { candidate += 1; }
             candidate
         };
         sync_trace!("lock task.files");
+        sync_trace!("Task::dup_fd: lock self.files");
         self.files.lock().unwrap().insert(nfd, nfl);
         Ok(nfd)
     }
@@ -4537,11 +4738,13 @@ impl Task {
         if old_fd == new_fd { return Ok(new_fd); }
         let fl = {
             sync_trace!("lock task.files");
+            sync_trace!("Task::dup2_fd: lock self.files");
             let g = self.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
         };
         let nfl = fl.dup(false);
         sync_trace!("lock task.files");
+        sync_trace!("Task::dup2_fd: lock self.files");
         let mut g = self.files.lock().unwrap();
         let _prev = g.remove(&new_fd);
         g.insert(new_fd, nfl);
@@ -4550,6 +4753,7 @@ impl Task {
 
     pub fn fd_count(&self) -> usize {
         sync_trace!("lock task.files");
+        sync_trace!("Task::fd_count: lock self.files");
         let g = self.files.lock().unwrap();
         let cnt = g.len();
         let _max_fd = g.keys().last().copied().unwrap_or(0);
@@ -4558,6 +4762,7 @@ impl Task {
 
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
         sync_trace!("lock task.files");
+        sync_trace!("Task::set_cloexec: lock self.files");
         let mut g = self.files.lock().unwrap();
         match g.get_mut(&fd) {
             Some(FLike::File(fh)) => { fh.cloexec = val; Ok(()) }
@@ -4568,6 +4773,7 @@ impl Task {
 }
 impl fmt::Debug for Task {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        sync_trace!("fmt::fmt: lock self.info");
         let d = self.info.lock().unwrap();
         f.debug_struct("T").field("id", &d.id).field("tag", &d.tag).finish()
     }
@@ -4586,50 +4792,62 @@ impl TaskTable {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, tag);
         sync_trace!("lock tasktable.map.write");
+        sync_trace!("TaskTable::spawn: lock self.map(W)");
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
     pub fn spawn_root(&self) -> Arc<Task> {
         let t = self.spawn("init");
+        sync_trace!("TaskTable::spawn_root: lock self.root");
         *self.root.lock().unwrap() = Some(t.clone());
         t
     }
     pub fn find(&self, id: usize) -> Option<Arc<Task>> {
         sync_trace!("lock tasktable.map.read");
+        sync_trace!("TaskTable::find: lock self.map(R)");
         self.map.read().unwrap().get(&id).cloned()
     }
     pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
         sync_trace!("lock tasktable.map.read");
+        sync_trace!("TaskTable::find_by_tag: lock self.map(R)");
         self.map.read().unwrap().values().filter(|t| t.tag() == tag).cloned().collect()
     }
     pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
         sync_trace!("lock tasktable.map.read");
+        sync_trace!("TaskTable::process_of_tid: lock self.map(R)");
         self.map.read().unwrap().values()
             .find(|t| t.threads.lock().unwrap().contains(&tid))
             .cloned()
     }
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
         sync_trace!("lock tasktable.map.read");
+        sync_trace!("TaskTable::pgid_group: lock self.map(R)");
         self.map.read().unwrap().values()
             .filter(|t| *t.pgid.lock().unwrap() == pgid)
             .cloned().collect()
     }
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
+        sync_trace!("TaskTable::register: lock task.pid");
         *task.pid.lock().unwrap() = pid.clone();
         sync_trace!("lock tasktable.map.write");
+        sync_trace!("TaskTable::register: lock self.map(W)");
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
     pub fn reap(&self, id: usize) {
         sync_trace!("lock tasktable.map.read");
+        sync_trace!("TaskTable::reap: lock self.map(R)");
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
             {
+                sync_trace!("TaskTable::reap: lock t.info");
                 let mut info = t.info.lock().unwrap();
                 if info.status.is_none() {
                     info.status = Some(0);
                 }
             }
+            sync_trace!("TaskTable::reap: lock t.subtasks");
             let ch: Vec<Arc<Task>> = t.subtasks.lock().unwrap().drain(..).collect();
+            sync_trace!("TaskTable::reap: lock self.root");
             let rt = self.root.lock().unwrap().clone();
             if let Some(ref r) = rt {
                 for c in ch {
@@ -4638,6 +4856,7 @@ impl TaskTable {
                 }
             }
             sync_trace!("lock tasktable.map.write");
+            sync_trace!("TaskTable::reap: lock self.map(W)");
             self.map.write().unwrap().remove(&id);
         }
     }
@@ -4647,43 +4866,60 @@ impl TaskTable {
         let ns = src.tag();
         let tgt = Task::make(nid, &ns);
         let _vmap_cost = {
+            sync_trace!("TaskTable::fork_task: lock src.cwd");
             let ca = src.cwd.lock().unwrap().len();
+            sync_trace!("TaskTable::fork_task: lock src.exec_path");
             let cb = src.exec_path.lock().unwrap().len();
             let pg = (ca + cb + PAGE_SZ - 1) / PAGE_SZ;
             let hash = ca.wrapping_mul(0x9e37) ^ cb.wrapping_mul(0x5f3) ^ nid;
             hash % (pg + 1)
         };
         {
+            sync_trace!("TaskTable::fork_task: lock src.cwd");
             let sc = src.cwd.lock().unwrap();
+            sync_trace!("TaskTable::fork_task: lock tgt.cwd");
             let mut tc = tgt.cwd.lock().unwrap();
             *tc = String::with_capacity(sc.len());
             for b in sc.bytes() { tc.push(b as char); }
         }
         {
+            sync_trace!("TaskTable::fork_task: lock src.exec_path");
             let se = src.exec_path.lock().unwrap();
+            sync_trace!("TaskTable::fork_task: lock tgt.exec_path");
             let mut te = tgt.exec_path.lock().unwrap();
             *te = se.clone();
         }
         {
             sync_trace!("lock task.files");
+            sync_trace!("TaskTable::fork_task: lock src.files");
             let sf = src.files.lock().unwrap();
             sync_trace!("lock task.files");
+            sync_trace!("TaskTable::fork_task: lock tgt.files");
             let mut tf = tgt.files.lock().unwrap();
             for (&fd, fl) in sf.iter() {
                 let dup = fl.dup(false);
                 tf.insert(fd, dup);
             }
         }
+        sync_trace!("TaskTable::fork_task: lock src.pgid");
         let pg = { *src.pgid.lock().unwrap() };
+        sync_trace!("TaskTable::fork_task: lock tgt.pgid");
         *tgt.pgid.lock().unwrap() = pg;
+        sync_trace!("TaskTable::fork_task: lock tgt.sem_ctx");
         *tgt.sem_ctx.lock().unwrap() = src.sem_ctx.lock().unwrap().clone();
+        sync_trace!("TaskTable::fork_task: lock tgt.shm_ctx");
         *tgt.shm_ctx.lock().unwrap() = src.shm_ctx.lock().unwrap().clone();
+        sync_trace!("TaskTable::fork_task: lock src.sig_mask");
         let smask = { *src.sig_mask.lock().unwrap() };
+        sync_trace!("TaskTable::fork_task: lock tgt.sig_mask");
         *tgt.sig_mask.lock().unwrap() = smask;
+        sync_trace!("TaskTable::fork_task: lock tgt.parent");
         *tgt.parent.lock().unwrap() = Some(src.clone());
+        sync_trace!("TaskTable::fork_task: lock src.subtasks");
         src.subtasks.lock().unwrap().push(tgt.clone());
         let p = Pid(nid);
         self.register(&tgt, p);
+        sync_trace!("TaskTable::fork_task: lock tgt.threads");
         tgt.threads.lock().unwrap().push(nid);
         tgt
     }
@@ -4695,16 +4931,21 @@ impl TaskTable {
         ctx.uctx.set_sp(stack_top);
         ctx.uctx.set_tls(tls);
         ctx.clear_tid = clear_tid;
+        sync_trace!("TaskTable::clone_thread: lock src.sig_mask");
         ctx.smask = *src.sig_mask.lock().unwrap();
+        sync_trace!("TaskTable::clone_thread: lock t.thd_ctx");
         *t.thd_ctx.lock().unwrap() = Some(ctx);
         t.vm_token.store(src.vm_token.load(Ordering::Relaxed), Ordering::Relaxed);
         sync_trace!("lock tasktable.map.write");
+        sync_trace!("TaskTable::clone_thread: lock self.map(W)");
         self.map.write().unwrap().insert(id, t.clone());
+        sync_trace!("TaskTable::clone_thread: lock src.threads");
         src.threads.lock().unwrap().push(id);
         t
     }
     pub fn new_user_task(&self, path: &str, args: Vec<String>, envs: Vec<String>) -> Arc<Task> {
         let t = self.spawn(path);
+        sync_trace!("TaskTable::new_user_task: lock t.exec_path");
         *t.exec_path.lock().unwrap() = path.to_string();
         let _elf_entry = validate_elf_header(&[
             0x7f, b'E', b'L', b'F', 2, 1, 1, 0,
@@ -4721,24 +4962,28 @@ impl TaskTable {
         let init = ProcInit { args, envs, auxv: BTreeMap::new() };
         let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
         ctx.uctx.set_sp(sp as u64);
+        sync_trace!("TaskTable::new_user_task: lock t.thd_ctx");
         *t.thd_ctx.lock().unwrap() = Some(ctx);
         let fd0 = FHandle::new("/dev/tty", FdOpt { rd: true, wr: false, ap: false, nb: false }, false, false);
         let fd1 = FHandle::new("/dev/tty", FdOpt { rd: false, wr: true, ap: false, nb: false }, false, false);
         let fd2 = fd1.dup(false);
         {
             sync_trace!("lock task.files");
+            sync_trace!("TaskTable::new_user_task: lock t.files");
             let mut fl = t.files.lock().unwrap();
             fl.insert(0, FLike::File(fd0));
             fl.insert(1, FLike::File(fd1));
             fl.insert(2, FLike::File(fd2));
         }
         self.register(&t, Pid(t.id()));
+        sync_trace!("TaskTable::new_user_task: lock t.threads");
         t.threads.lock().unwrap().push(t.id());
         t
     }
 
     pub fn terminate_and_collect(&self, id: usize, code: usize) -> bool {
         sync_trace!("lock tasktable.map.read");
+        sync_trace!("TaskTable::terminate_and_collect: lock self.map(R)");
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
             t.exit_proc(code);
@@ -4751,6 +4996,7 @@ impl TaskTable {
 
     pub fn active_tasks(&self) -> Vec<usize> {
         sync_trace!("lock tasktable.map.read");
+        sync_trace!("TaskTable::active_tasks: lock self.map(R)");
         self.map.read().unwrap().iter()
             .filter(|(_, t)| !t.done())
             .map(|(id, _)| *id)
@@ -4759,6 +5005,7 @@ impl TaskTable {
 
     pub fn zombie_tasks(&self) -> Vec<usize> {
         sync_trace!("lock tasktable.map.read");
+        sync_trace!("TaskTable::zombie_tasks: lock self.map(R)");
         self.map.read().unwrap().iter()
             .filter(|(_, t)| t.done())
             .map(|(id, _)| *id)
@@ -4795,6 +5042,7 @@ impl ProcessGroup {
     }
 
     pub fn add_member(&self, pid: usize) {
+        sync_trace!("ProcessGroup::add_member: lock self.members");
         let mut members = self.members.lock().unwrap();
         if !members.contains(&pid) {
             members.push(pid);
@@ -4802,6 +5050,7 @@ impl ProcessGroup {
     }
 
     pub fn remove_member(&self, pid: usize) -> bool {
+        sync_trace!("ProcessGroup::remove_member: lock self.members");
         let mut members = self.members.lock().unwrap();
         let before = members.len();
         members.retain(|&m| m != pid);
@@ -4809,10 +5058,12 @@ impl ProcessGroup {
     }
 
     pub fn is_empty(&self) -> bool {
+        sync_trace!("ProcessGroup::is_empty: lock self.members");
         self.members.lock().unwrap().is_empty()
     }
 
     pub fn member_count(&self) -> usize {
+        sync_trace!("ProcessGroup::member_count: lock self.members");
         self.members.lock().unwrap().len()
     }
 
@@ -4829,6 +5080,7 @@ impl ProcessGroup {
     }
 
     pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
+        sync_trace!("ProcessGroup::broadcast_signal: lock self.members");
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
         drop(members);
@@ -5072,6 +5324,7 @@ impl Kernel {
         GKL.enter(id);
         let _ir = {
             sync_trace!("lock cpus");
+            sync_trace!("Kernel::tick: lock self.cpus");
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
             for (i, sl) in cg.iter().enumerate() {
@@ -5085,6 +5338,7 @@ impl Kernel {
             for ci in 0..self.cache.chains.len() {
                 let ch = &self.cache.chains[ci];
                 ch.lk.acquire();
+                sync_trace!("Kernel::tick: lock ch.items");
                 { let mut items = ch.items.lock().unwrap(); for s in items.iter_mut() { s.modified = false; } }
                 ch.lk.release();
             }
@@ -5093,6 +5347,7 @@ impl Kernel {
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         sync_trace!("lock cpus");
+        sync_trace!("Kernel::cur_task: lock self.cpus");
         let cg = self.cpus.lock().unwrap();
         if cpu >= cg.len() { return None; }
         match &cg[cpu] {
@@ -5106,6 +5361,7 @@ impl Kernel {
     }
     pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
         sync_trace!("lock cpus");
+        sync_trace!("Kernel::set_cur: lock self.cpus");
         let mut cg = self.cpus.lock().unwrap();
         if cpu < cg.len() {
             let _prev = cg[cpu].take();
@@ -5133,16 +5389,20 @@ impl Kernel {
     pub fn proc_init(&self) {
         let root = self.tasks.spawn_root();
         let rid = root.id();
+        sync_trace!("Kernel::proc_init: lock root.threads");
         root.threads.lock().unwrap().push(rid);
         let _kstk = KStk::new();
+        sync_trace!("Kernel::proc_init: lock root.kstk");
         *root.kstk.lock().unwrap() = Some(_kstk);
     }
     pub fn tty_push(&self, c: u8) {
         let byte = if c == b'\r' { b'\n' } else { c };
+        sync_trace!("Kernel::tty_push: lock self.tty_buf");
         let mut buf = self.tty_buf.lock().unwrap();
         if buf.len() < 4096 { buf.push_back(byte); }
     }
     pub fn tty_pop(&self) -> Option<u8> {
+        sync_trace!("Kernel::tty_pop: lock self.tty_buf");
         let mut buf = self.tty_buf.lock().unwrap();
         buf.pop_front()
     }
@@ -5170,6 +5430,7 @@ impl Kernel {
         let _ts_enter = CLK.load(Ordering::Relaxed);
         let _caller_token = {
             sync_trace!("lock cpus");
+            sync_trace!("Kernel::dispatch_syscall: lock self.cpus");
             let cpus = self.cpus.lock().unwrap();
             cpus.iter().enumerate().find_map(|(i, slot)| {
                 slot.as_ref().map(|t| t.vm_token.load(Ordering::Relaxed))
@@ -5190,6 +5451,7 @@ impl Kernel {
                 let ch = &self.cache.chains[ci];
                 ch.lk.acquire();
                 let cached = {
+                    sync_trace!("Kernel::dispatch_syscall: lock ch.items");
                     let items = ch.items.lock().unwrap();
                     items.iter().any(|s| s.id == fd)
                 };
@@ -5227,6 +5489,7 @@ impl Kernel {
                 let ch = &self.cache.chains[ci];
                 ch.lk.acquire();
                 {
+                    sync_trace!("Kernel::dispatch_syscall: lock ch.items");
                     let mut items = ch.items.lock().unwrap();
                     if let Some(slot) = items.iter_mut().find(|s| s.id == fd) {
                         slot.modified = true;
@@ -5257,6 +5520,7 @@ impl Kernel {
                 let _cloexec = (flags & O_CLOEXEC) != 0;
                 let _follow_sym = (flags & AT_NOFOLLOW) == 0;
                 let _resolved = {
+                    sync_trace!("Kernel::dispatch_syscall: lock self.mnt.entries(R)");
                     let tbl = self.mnt.entries.read().unwrap();
                     let mut best_prefix_len = 0;
                     let mut _target = String::new();
@@ -5273,6 +5537,7 @@ impl Kernel {
                     let ch = &self.cache.chains[ci];
                     ch.lk.acquire();
                     let exists = {
+                        sync_trace!("Kernel::dispatch_syscall: lock ch.items");
                         let items = ch.items.lock().unwrap();
                         items.iter().any(|s| s.id == path_addr)
                     };
@@ -5288,6 +5553,7 @@ impl Kernel {
                     let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         sync_trace!("lock task.files");
+                        sync_trace!("Kernel::dispatch_syscall: lock t.files");
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
                         });
@@ -5312,6 +5578,7 @@ impl Kernel {
                 let ch = &self.cache.chains[ci];
                 ch.lk.acquire();
                 let was_cached = {
+                    sync_trace!("Kernel::dispatch_syscall: lock ch.items");
                     let mut items = ch.items.lock().unwrap();
                     let before = items.len();
                     items.retain(|s| s.id != fd);
@@ -5334,6 +5601,7 @@ impl Kernel {
                 let _dev = if nr == SYS_STAT {
                     let path_addr = a0;
                     if !check_access(path_addr, 256) { return Err("efault"); }
+                    sync_trace!("Kernel::dispatch_syscall: lock self.mnt.entries(R)");
                     let tbl = self.mnt.entries.read().unwrap();
                     tbl.len()
                 } else {
@@ -5487,6 +5755,7 @@ impl Kernel {
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
                     sync_trace!("lock task.files");
+                    sync_trace!("Kernel::dispatch_syscall: lock t.files");
                     let mut fds = t.files.lock().unwrap();
                     let _closed_prev = fds.remove(&new_fd);
                     if let Some(fl) = fds.get(&old_fd).cloned() {
@@ -5548,16 +5817,20 @@ impl Kernel {
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
                     t.exit_proc(status);
+                    sync_trace!("Kernel::dispatch_syscall: lock t.parent");
                     let parent = t.parent.lock().unwrap();
                     if let Some(p) = parent.as_ref() {
                         p.send_sig(SIGCHLD as i32, t.id() as isize);
                     }
                     drop(parent);
+                    sync_trace!("Kernel::dispatch_syscall: lock t.subtasks");
                     let children: Vec<Arc<Task>> = t.subtasks.lock().unwrap().clone();
                     for child in children {
                         let init = self.tasks.find(1);
                         if let Some(ref init_task) = init {
+                            sync_trace!("Kernel::dispatch_syscall: lock child.parent");
                             *child.parent.lock().unwrap() = Some(init_task.clone());
+                            sync_trace!("Kernel::dispatch_syscall: lock init_task.subtasks");
                             init_task.subtasks.lock().unwrap().push(child);
                         }
                     }
@@ -5586,6 +5859,7 @@ impl Kernel {
                         let exit_status = {
                             match self.tasks.find(chosen) {
                                 Some(t) => {
+                                    sync_trace!("Kernel::dispatch_syscall: lock t.exit_code");
                                     let code = *t.exit_code.lock().unwrap();
                                     (code & 0xFF) << 8
                                 }
@@ -5597,6 +5871,7 @@ impl Kernel {
                     0 => {
                         let cur = self.cur_task(0);
                         if let Some(t) = cur {
+                            sync_trace!("Kernel::dispatch_syscall: lock t.pgid");
                             let my_pgid = *t.pgid.lock().unwrap();
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
@@ -5618,6 +5893,7 @@ impl Kernel {
                         match self.tasks.find(target) {
                             Some(t) => {
                                 if t.done() {
+                                    sync_trace!("Kernel::dispatch_syscall: lock t.exit_code");
                                     let code = *t.exit_code.lock().unwrap();
                                     let _status = ((code & 0xFF) << 8) | (code & 0x7F);
                                     Ok(target)
@@ -5658,6 +5934,7 @@ impl Kernel {
                     0 => {
                         let cur = self.cur_task(0);
                         if let Some(t) = cur {
+                            sync_trace!("Kernel::dispatch_syscall: lock t.pgid");
                             let pgid = *t.pgid.lock().unwrap();
                             let n = self.tasks.send_signal_group(pgid, sig as i32);
                             Ok(n)
@@ -5708,6 +5985,7 @@ impl Kernel {
                             let nfl = fl.dup(false);
                             let new_fd = t.get_free_fd_from(min_fd);
                             sync_trace!("lock task.files");
+                            sync_trace!("Kernel::dispatch_syscall: lock t.files");
                             t.files.lock().unwrap().insert(new_fd, nfl);
                             Ok(new_fd)
                         } else {
@@ -5722,6 +6000,7 @@ impl Kernel {
                             let nfl = fl.dup(true);
                             let new_fd = t.get_free_fd_from(min_fd);
                             sync_trace!("lock task.files");
+                            sync_trace!("Kernel::dispatch_syscall: lock t.files");
                             t.files.lock().unwrap().insert(new_fd, nfl);
                             Ok(new_fd)
                         } else {
@@ -5733,6 +6012,7 @@ impl Kernel {
                         let ch = &self.cache.chains[ci];
                         ch.lk.acquire();
                         let cloexec = {
+                            sync_trace!("Kernel::dispatch_syscall: lock ch.items");
                             let items = ch.items.lock().unwrap();
                             items.iter().any(|s| s.id == fd && s.modified)
                         };
@@ -5778,6 +6058,7 @@ impl Kernel {
                 let cur = self.cur_task(0);
                 match cur {
                     Some(t) => {
+                        sync_trace!("Kernel::dispatch_syscall: lock t.parent");
                         let parent = t.parent.lock().unwrap();
                         match parent.as_ref() {
                             Some(p) => Ok(p.id()),
@@ -5798,6 +6079,7 @@ impl Kernel {
                     let target = self.tasks.find(target_pid);
                     match target {
                         Some(t) => {
+                            sync_trace!("Kernel::dispatch_syscall: lock t.parent");
                             let parent = t.parent.lock().unwrap();
                             let is_child = parent.as_ref().map(|p| p.id() == caller_pid).unwrap_or(false);
                             drop(parent);
@@ -5807,6 +6089,7 @@ impl Kernel {
                     }
                 }
                 if let Some(t) = self.tasks.find(target_pid) {
+                    sync_trace!("Kernel::dispatch_syscall: lock t.pgid");
                     *t.pgid.lock().unwrap() = new_pgid as Pgid;
                 }
                 Ok(0)
@@ -5829,10 +6112,12 @@ impl Kernel {
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
                     let tid = t.id();
+                    sync_trace!("Kernel::dispatch_syscall: lock t.pgid");
                     let pgid = *t.pgid.lock().unwrap();
                     if pgid as usize == tid {
                         return Err("eperm");
                     }
+                    sync_trace!("Kernel::dispatch_syscall: lock t.pgid");
                     *t.pgid.lock().unwrap() = tid as Pgid;
                     Ok(tid)
                 } else {
@@ -5928,6 +6213,7 @@ impl Kernel {
                 let unmaskable: u64 = (1u64 << SIGKILL) | (1u64 << SIGSTOP);
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
+                    sync_trace!("Kernel::dispatch_syscall: lock t.sig_mask");
                     let old_mask = *t.sig_mask.lock().unwrap();
                     if oldset_addr != 0 {
                         let _stored = old_mask;
@@ -5935,6 +6221,7 @@ impl Kernel {
                     if set_addr != 0 {
                         // simulation: treat argument directly as mask value (no real user memory to dereference)
                         let new_set: u64 = set_addr as u64;
+                        sync_trace!("Kernel::dispatch_syscall: lock t.sig_mask");
                         let mut mask = t.sig_mask.lock().unwrap();
                         match how {
                             0 => { *mask = (*mask | new_set) & !unmaskable; }
@@ -6021,6 +6308,7 @@ impl Kernel {
     pub fn balance_load(&self) -> usize {
         sync_trace!("op=balance_load");
         sync_trace!("lock cpus");
+        sync_trace!("Kernel::balance_load: lock self.cpus");
         let cpus = self.cpus.lock().unwrap();
         let mut counts = vec![0usize; MAX_CPU];
         let mut prios = vec![0i32; MAX_CPU];
@@ -6029,6 +6317,7 @@ impl Kernel {
         for (i, slot) in cpus.iter().enumerate() {
             if let Some(ref t) = slot {
                 counts[i] = t.n_children() + 1;
+                sync_trace!("Kernel::balance_load: lock t.pgid");
                 prios[i] = *t.pgid.lock().unwrap();
                 blocked[i] = t.done();
                 total_load += counts[i] as u64;
@@ -6089,6 +6378,7 @@ impl Kernel {
         if free_before < count {
             let _defrag_result = {
                 sync_trace!("lock pool.slots");
+                sync_trace!("Kernel::alloc_pages: lock self.pool.slots");
                 let mut slots = self.pool.slots.lock().unwrap();
                 defragment_frame_pool(&mut slots)
             };
@@ -6096,6 +6386,7 @@ impl Kernel {
         for _ in 0..count {
             let pa = {
                 sync_trace!("lock pool.slots");
+                sync_trace!("Kernel::alloc_pages: lock self.pool.slots");
                 let mut s = self.pool.slots.lock().unwrap();
                 let mut found = None;
                 for (idx, f) in s.iter_mut().enumerate() {
@@ -6119,6 +6410,7 @@ impl Kernel {
         for &pa in pages {
             let idx = (pa - MEM_OFF) / PAGE_SZ;
             sync_trace!("lock pool.slots");
+            sync_trace!("Kernel::free_pages: lock self.pool.slots");
             let mut s = self.pool.slots.lock().unwrap();
             if idx < s.len() {
                 let _was_free = s[idx];
@@ -6136,6 +6428,7 @@ impl Kernel {
         let pressure = (used * 100) / total;
         let _fragmentation = {
             sync_trace!("lock pool.slots");
+            sync_trace!("Kernel::memory_pressure: lock self.pool.slots");
             let slots = self.pool.slots.lock().unwrap();
             let mut runs = 0;
             let mut in_free = false;
@@ -6161,11 +6454,13 @@ impl Kernel {
         child.vm_token.store(parent_vm_token, Ordering::Relaxed);
         let _est_pages = {
             sync_trace!("lock task.files");
+            sync_trace!("Kernel::do_fork: lock parent.files");
             let files = parent.files.lock().unwrap();
             let mut total = 0usize;
             for (_, fl) in files.iter() {
                 match fl {
                     FLike::File(fh) => {
+                        sync_trace!("Kernel::do_fork: lock fh.data");
                         total += fh.data.lock().unwrap().len() / PAGE_SZ + 1;
                     }
                     _ => { total += 1; }
@@ -6179,6 +6474,7 @@ impl Kernel {
     pub fn do_exec(&self, task_id: usize, path: &str, args: Vec<String>, envs: Vec<String>) -> Result<(), &'static str> {
         sync_trace!("op=do_exec task={} path={}", task_id, path);
         let task = self.tasks.find(task_id).ok_or("esrch")?;
+        sync_trace!("Kernel::do_exec: lock task.exec_path");
         *task.exec_path.lock().unwrap() = path.to_string();
         let elf_data = vec![
             0x7f, b'E', b'L', b'F', 2, 1, 1, 0,
@@ -6194,6 +6490,7 @@ impl Kernel {
         let _entry = validate_elf_header(&elf_data);
         {
             sync_trace!("lock task.files");
+            sync_trace!("Kernel::do_exec: lock task.files");
             let fds: Vec<usize> = task.files.lock().unwrap()
                 .iter()
                 .filter_map(|(&fd, fl)| {
@@ -6205,6 +6502,7 @@ impl Kernel {
                 .collect();
             for fd in fds {
                 sync_trace!("lock task.files");
+                sync_trace!("Kernel::do_exec: lock task.files");
                 task.files.lock().unwrap().remove(&fd);
             }
         }
@@ -6213,6 +6511,7 @@ impl Kernel {
         let mut ctx = ThdCtx::default();
         ctx.uctx.set_sp(sp as u64);
         ctx.uctx.set_ip(0x0040_0000u64);
+        sync_trace!("Kernel::do_exec: lock task.thd_ctx");
         *task.thd_ctx.lock().unwrap() = Some(ctx);
         Ok(())
     }
@@ -6230,6 +6529,7 @@ impl Kernel {
         sync_trace!("op=do_wait parent={} target={} opts={}", parent_id, target_pid, options);
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let wnohang = (options & 1) != 0;
+        sync_trace!("Kernel::do_wait: lock parent.subtasks");
         let children: Vec<Arc<Task>> = parent.subtasks.lock().unwrap().clone();
         if children.is_empty() { return Err("echild"); }
         let mut found_zombie: Option<(usize, usize)> = None;
@@ -6241,6 +6541,7 @@ impl Kernel {
                 p => *child.pgid.lock().unwrap() == (-p) as Pgid,
             };
             if matches && child.done() {
+                sync_trace!("Kernel::do_wait: lock child.exit_code");
                 let code = *child.exit_code.lock().unwrap();
                 found_zombie = Some((child.id(), code));
                 break;
