@@ -170,13 +170,19 @@ pub const IOQUEUE_DEPTH: usize = 128;
 
 pub static SYNC_TRACE: AtomicBool = AtomicBool::new(true);
 pub static TRACE_BUF: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static HOOK_INIT: std::sync::Once = std::sync::Once::new();
 const TRACE_BUF_CAP: usize = 1000;
 
 macro_rules! sync_trace {
     ($($arg:tt)*) => {
         if SYNC_TRACE.load(Ordering::Relaxed) {
+            HOOK_INIT.call_once(|| {
+                std::panic::set_hook(Box::new(|info| {
+                    sync_trace_dump();
+                    println!("{}", info);
+                }));
+            });
             let msg = format!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
-            println!("{}", msg);
             if let Ok(mut buf) = TRACE_BUF.try_lock() {
                 if buf.len() >= TRACE_BUF_CAP { buf.pop_front(); }
                 buf.push_back(msg);
@@ -254,8 +260,8 @@ impl KernLock {
         sync_trace!("KernLock::leave: lock self.holder");
         *self.holder.lock().unwrap() = None;
         self.depth.store(0, Ordering::Relaxed);
-        self.flag.store(false, Ordering::Release);
         sync_trace!("GKL released");
+        self.flag.store(false, Ordering::Release);
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
     pub fn owner(&self) -> usize { self.dbg_tag.load(Ordering::Relaxed) }
@@ -5298,10 +5304,6 @@ pub struct Kernel {
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
-        std::panic::set_hook(Box::new(|info| {
-            sync_trace_dump();
-            println!("{}", info);
-        }));
         Self {
             tasks: TaskTable::new(),
             cache: BlockCache::new(N_CHAINS),
