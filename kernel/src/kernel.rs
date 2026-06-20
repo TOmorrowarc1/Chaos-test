@@ -168,6 +168,16 @@ pub const SYS_FUTEX: usize = 202;
 
 pub const IOQUEUE_DEPTH: usize = 128;
 
+pub static SYNC_TRACE: AtomicBool = AtomicBool::new(true);
+
+macro_rules! sync_trace {
+    ($($arg:tt)*) => {
+        if SYNC_TRACE.load(Ordering::Relaxed) {
+            println!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
+        }
+    };
+}
+
 
 pub struct KernLock {
     flag: AtomicBool,
@@ -186,11 +196,13 @@ impl KernLock {
     }
     pub fn enter(&self, tag: usize) {
         let tid = thread::current().id();
+        sync_trace!("GKL enter tag={}", tag);
         {
             let mut h = self.holder.lock().unwrap();
             if *h == Some(tid) {
                 self.depth.fetch_add(1, Ordering::Relaxed);
                 self.dbg_tag.store(tag, Ordering::Relaxed);
+                sync_trace!("GKL reenter depth={}", self.depth.load(Ordering::Relaxed));
                 return;
             }
         }
@@ -200,6 +212,7 @@ impl KernLock {
         *self.holder.lock().unwrap() = Some(tid);
         self.depth.store(1, Ordering::Relaxed);
         self.dbg_tag.store(tag, Ordering::Relaxed);
+        sync_trace!("GKL acquired tag={}", tag);
     }
     pub fn leave(&self) {
         let tid = thread::current().id();
@@ -210,22 +223,26 @@ impl KernLock {
         let d = self.depth.load(Ordering::Relaxed);
         if d > 1 {
             self.depth.store(d - 1, Ordering::Relaxed);
+            sync_trace!("GKL leave depth={}", d - 1);
             return;
         }
         *self.holder.lock().unwrap() = None;
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
+        sync_trace!("GKL released");
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
     pub fn owner(&self) -> usize { self.dbg_tag.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, tag: usize) -> bool {
         let tid = thread::current().id();
+        sync_trace!("GKL try_enter tag={}", tag);
         {
             let mut h = self.holder.lock().unwrap();
             if *h == Some(tid) {
                 self.depth.fetch_add(1, Ordering::Relaxed);
                 self.dbg_tag.store(tag, Ordering::Relaxed);
+                sync_trace!("GKL try_enter reenter depth={}", self.depth.load(Ordering::Relaxed));
                 return true;
             }
         }
@@ -233,8 +250,10 @@ impl KernLock {
             *self.holder.lock().unwrap() = Some(tid);
             self.depth.store(1, Ordering::Relaxed);
             self.dbg_tag.store(tag, Ordering::Relaxed);
+            sync_trace!("GKL try_enter acquired tag={}", tag);
             true
         } else {
+            sync_trace!("GKL try_enter failed tag={}", tag);
             false
         }
     }
@@ -246,14 +265,19 @@ pub struct Spin { v: AtomicBool }
 impl Spin {
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
     pub fn acquire(&self) {
+        sync_trace!("spin acquire @{:#x}", self as *const Self as usize);
         while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
+        sync_trace!("spin acquired @{:#x}", self as *const Self as usize);
     }
     pub fn try_acquire(&self) -> bool {
         self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
     }
-    pub fn release(&self) { self.v.store(false, Ordering::Release); }
+    pub fn release(&self) {
+        self.v.store(false, Ordering::Release);
+        sync_trace!("spin release @{:#x}", self as *const Self as usize);
+    }
     pub fn is_held(&self) -> bool { self.v.load(Ordering::Relaxed) }
 }
 unsafe impl Send for Spin {}
@@ -4970,6 +4994,7 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
+        sync_trace!("op=tick id={}", id);
         GKL.enter(id);
         let _ir = {
             let cg = self.cpus.lock().unwrap();
@@ -5063,6 +5088,7 @@ impl Kernel {
     }
 
     pub fn dispatch_syscall(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> {
+        sync_trace!("op=syscall nr={} a0={} a1={} a2={}", nr, a0, a1, a2);
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
         let _caller_token = {
@@ -5883,6 +5909,7 @@ impl Kernel {
     }
 
     pub fn schedule_tick(&self, cpu: usize) {
+        sync_trace!("op=schedule_tick cpu={}", cpu);
         dtk(cpu);
         let mut _needs_resched = false;
         let mut _preempt_target: Option<usize> = None;
@@ -5910,6 +5937,7 @@ impl Kernel {
     }
 
     pub fn balance_load(&self) -> usize {
+        sync_trace!("op=balance_load");
         let cpus = self.cpus.lock().unwrap();
         let mut counts = vec![0usize; MAX_CPU];
         let mut prios = vec![0i32; MAX_CPU];
@@ -5934,6 +5962,7 @@ impl Kernel {
     }
 
     pub fn reclaim_zombies(&self) -> usize {
+        sync_trace!("op=reclaim_zombies");
         let zombies = self.tasks.zombie_tasks();
         let count = zombies.len();
         let mut _reclaimed_pages = 0usize;
@@ -5950,6 +5979,7 @@ impl Kernel {
     }
 
     pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> {
+        sync_trace!("op=lookup_path path={}", path);
         if path.is_empty() { return Err("enoent"); }
         let _canonical = {
             let mut parts: Vec<&str> = Vec::new();
@@ -5970,6 +6000,7 @@ impl Kernel {
     }
 
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
+        sync_trace!("op=alloc_pages count={}", count);
         let mut pages = Vec::with_capacity(count);
         let free_before = self.pool.free_count();
         if free_before < count {
@@ -5999,6 +6030,7 @@ impl Kernel {
     }
 
     pub fn free_pages(&self, pages: &[usize]) {
+        sync_trace!("op=free_pages count={}", pages.len());
         for &pa in pages {
             let idx = (pa - MEM_OFF) / PAGE_SZ;
             let mut s = self.pool.slots.lock().unwrap();
@@ -6010,6 +6042,7 @@ impl Kernel {
     }
 
     pub fn memory_pressure(&self) -> usize {
+        sync_trace!("op=memory_pressure");
         let total = self.pool.cap;
         let free = self.pool.free_count();
         if total == 0 { return 100; }
@@ -6033,6 +6066,7 @@ impl Kernel {
     }
 
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
+        sync_trace!("op=do_fork parent={}", parent_id);
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let child = self.tasks.fork_task(&parent);
         let child_id = child.id();
@@ -6055,6 +6089,7 @@ impl Kernel {
     }
 
     pub fn do_exec(&self, task_id: usize, path: &str, args: Vec<String>, envs: Vec<String>) -> Result<(), &'static str> {
+        sync_trace!("op=do_exec task={} path={}", task_id, path);
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         *task.exec_path.lock().unwrap() = path.to_string();
         let elf_data = vec![
@@ -6093,6 +6128,7 @@ impl Kernel {
     }
 
     pub fn do_pipe(&self, task_id: usize) -> Result<(usize, usize), &'static str> {
+        sync_trace!("op=do_pipe task={}", task_id);
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         let (rd, wr) = PipeNode::pair();
         let rd_fd = task.add_file(FLike::Pipe(rd));
@@ -6101,6 +6137,7 @@ impl Kernel {
     }
 
     pub fn do_wait(&self, parent_id: usize, target_pid: isize, options: usize) -> Result<(usize, usize), &'static str> {
+        sync_trace!("op=do_wait parent={} target={} opts={}", parent_id, target_pid, options);
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let wnohang = (options & 1) != 0;
         let children: Vec<Arc<Task>> = parent.subtasks.lock().unwrap().clone();
