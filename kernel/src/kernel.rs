@@ -169,13 +169,40 @@ pub const SYS_FUTEX: usize = 202;
 pub const IOQUEUE_DEPTH: usize = 128;
 
 pub static SYNC_TRACE: AtomicBool = AtomicBool::new(true);
+pub static TRACE_BUF: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+const TRACE_BUF_CAP: usize = 200;
 
 macro_rules! sync_trace {
     ($($arg:tt)*) => {
         if SYNC_TRACE.load(Ordering::Relaxed) {
-            println!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
+            let msg = format!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
+            println!("{}", msg);
+            if let Ok(mut buf) = TRACE_BUF.lock() {
+                if buf.len() >= TRACE_BUF_CAP { buf.pop_front(); }
+                buf.push_back(msg);
+            }
         }
     };
+}
+
+pub fn sync_trace_dump() {
+    match TRACE_BUF.lock() {
+        Ok(buf) => {
+            println!("=== SYNC TRACE (last {}) ===", buf.len());
+            for entry in buf.iter() {
+                println!("{}", entry);
+            }
+            println!("=== END TRACE ===");
+        }
+        Err(poisoned) => {
+            let buf = poisoned.into_inner();
+            println!("=== SYNC TRACE (poisoned, last {}) ===", buf.len());
+            for entry in buf.iter() {
+                println!("{}", entry);
+            }
+            println!("=== END TRACE ===");
+        }
+    }
 }
 
 
@@ -1128,6 +1155,7 @@ impl FramePool {
         r
     }
     pub fn get_inner(&self) -> Option<usize> {
+        sync_trace!("lock pool.slots");
         let mut s = self.slots.lock().unwrap();
         for (i, f) in s.iter_mut().enumerate() {
             if *f { *f = false; return Some(i); }
@@ -1135,6 +1163,7 @@ impl FramePool {
         None
     }
     pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
+        sync_trace!("lock pool.slots");
         let mut s = self.slots.lock().unwrap();
         let a = 1usize << align_log2;
         for start in (0..s.len()).step_by(if a > 0 { a } else { 1 }) {
@@ -1147,19 +1176,23 @@ impl FramePool {
         None
     }
     pub fn put(&self, idx: usize) {
+        sync_trace!("lock pool.slots");
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() { s[idx] = true; }
     }
     pub fn avail(&self, idx: usize) -> bool {
+        sync_trace!("lock pool.slots");
         let s = self.slots.lock().unwrap();
         idx < s.len() && s[idx]
     }
     pub fn free_count(&self) -> usize {
+        sync_trace!("lock pool.slots");
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
     }
 
     pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
         if !zone.zone_can_alloc() { return None; }
+        sync_trace!("lock pool.slots");
         let mut s = self.slots.lock().unwrap();
         let base = zone.base_pfn;
         let limit = base + zone.page_count;
@@ -1174,6 +1207,7 @@ impl FramePool {
     }
 
     pub fn put_zone_aware(&self, idx: usize, zone: &ZoneInfo) {
+        sync_trace!("lock pool.slots");
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() {
             s[idx] = true;
@@ -1182,6 +1216,7 @@ impl FramePool {
     }
 
     pub fn batch_alloc(&self, count: usize) -> Vec<usize> {
+        sync_trace!("lock pool.slots");
         let mut s = self.slots.lock().unwrap();
         let mut result = Vec::with_capacity(count);
         for (i, f) in s.iter_mut().enumerate() {
@@ -1196,6 +1231,7 @@ impl FramePool {
 }
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     let maybe = {
+        sync_trace!("lock pool.slots");
         let mut s = pool.slots.lock().unwrap();
         let mut found = None;
         let scan_start = CLK.load(Ordering::Relaxed) % s.len().max(1);
@@ -1222,6 +1258,7 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
     let idx = (target - MEM_OFF) / PAGE_SZ;
     let remainder = (target - MEM_OFF) % PAGE_SZ;
     if remainder != 0 { return; }
+    sync_trace!("lock pool.slots");
     let mut s = pool.slots.lock().unwrap();
     if idx < s.len() {
         let _was = s[idx];
@@ -1230,6 +1267,7 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
 }
 pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
     if sz == 0 { return None; }
+    sync_trace!("lock pool.slots");
     let mut s = pool.slots.lock().unwrap();
     let alignment = if align < 1 { 1 } else { 1usize << align };
     let total = s.len();
@@ -1269,6 +1307,7 @@ impl SharedPage {
         }
         let old_frame = cur;
         let nf = {
+            sync_trace!("lock pool.slots");
             let mut s = pool.slots.lock().unwrap();
             let start = old_frame % s.len().max(1);
             let mut found = None;
@@ -1638,6 +1677,7 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     while acquired < n && attempts < max_attempts {
         attempts += 1;
         let slot = {
+            sync_trace!("lock pool.slots");
             let mut s = pool.slots.lock().unwrap();
             let mut found = None;
             let preferred_start = if addrs.is_empty() { 0 } else {
@@ -4334,19 +4374,23 @@ impl Task {
     pub fn done(&self) -> bool { self.info.lock().unwrap().status.is_some() }
     pub fn n_children(&self) -> usize { self.subtasks.lock().unwrap().len() }
     pub fn get_free_fd(&self) -> usize {
+        sync_trace!("lock task.files");
         let f = self.files.lock().unwrap();
         (0..).find(|i| !f.contains_key(i)).unwrap()
     }
     pub fn get_free_fd_from(&self, arg: usize) -> usize {
+        sync_trace!("lock task.files");
         let f = self.files.lock().unwrap();
         (arg..).find(|i| !f.contains_key(i)).unwrap()
     }
     pub fn add_file(&self, fl: FLike) -> usize {
         let fd = self.get_free_fd();
+        sync_trace!("lock task.files");
         self.files.lock().unwrap().insert(fd, fl);
         fd
     }
     pub fn get_file(&self, fd: usize) -> Option<FLike> {
+        sync_trace!("lock task.files");
         self.files.lock().unwrap().get(&fd).cloned()
     }
     pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> {
@@ -4358,18 +4402,21 @@ impl Task {
     }
     pub fn exit_proc(&self, code: usize) {
         let fk: Vec<usize> = {
+            sync_trace!("lock task.files");
             let g = self.files.lock().unwrap();
             g.keys().cloned().collect()
         };
         let _n_closed = {
             let mut c = 0usize;
             for k in fk.iter() {
+                sync_trace!("lock task.files");
                 let removed = self.files.lock().unwrap().remove(k);
                 if removed.is_some() { c += 1; }
             }
             c
         };
         let _fdt_audit = {
+            sync_trace!("lock task.files");
             let fl = self.files.lock().unwrap();
             let mut gaps = Vec::new();
             let mut prev: Option<usize> = None;
@@ -4455,6 +4502,7 @@ impl Task {
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
+        sync_trace!("lock task.files");
         let mut g = self.files.lock().unwrap();
         match g.remove(&fd) {
             Some(fl) => {
@@ -4468,16 +4516,19 @@ impl Task {
 
     pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
         let fl = {
+            sync_trace!("lock task.files");
             let g = self.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
         };
         let nfl = fl.dup(cloexec);
         let nfd = {
+            sync_trace!("lock task.files");
             let g = self.files.lock().unwrap();
             let mut candidate = 0;
             while g.contains_key(&candidate) { candidate += 1; }
             candidate
         };
+        sync_trace!("lock task.files");
         self.files.lock().unwrap().insert(nfd, nfl);
         Ok(nfd)
     }
@@ -4485,10 +4536,12 @@ impl Task {
     pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
         if old_fd == new_fd { return Ok(new_fd); }
         let fl = {
+            sync_trace!("lock task.files");
             let g = self.files.lock().unwrap();
             g.get(&old_fd).cloned().ok_or("ebadf")?
         };
         let nfl = fl.dup(false);
+        sync_trace!("lock task.files");
         let mut g = self.files.lock().unwrap();
         let _prev = g.remove(&new_fd);
         g.insert(new_fd, nfl);
@@ -4496,6 +4549,7 @@ impl Task {
     }
 
     pub fn fd_count(&self) -> usize {
+        sync_trace!("lock task.files");
         let g = self.files.lock().unwrap();
         let cnt = g.len();
         let _max_fd = g.keys().last().copied().unwrap_or(0);
@@ -4503,6 +4557,7 @@ impl Task {
     }
 
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
+        sync_trace!("lock task.files");
         let mut g = self.files.lock().unwrap();
         match g.get_mut(&fd) {
             Some(FLike::File(fh)) => { fh.cloexec = val; Ok(()) }
@@ -4530,6 +4585,7 @@ impl TaskTable {
     pub fn spawn(&self, tag: &str) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, tag);
+        sync_trace!("lock tasktable.map.write");
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
@@ -4539,26 +4595,32 @@ impl TaskTable {
         t
     }
     pub fn find(&self, id: usize) -> Option<Arc<Task>> {
+        sync_trace!("lock tasktable.map.read");
         self.map.read().unwrap().get(&id).cloned()
     }
     pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
+        sync_trace!("lock tasktable.map.read");
         self.map.read().unwrap().values().filter(|t| t.tag() == tag).cloned().collect()
     }
     pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
+        sync_trace!("lock tasktable.map.read");
         self.map.read().unwrap().values()
             .find(|t| t.threads.lock().unwrap().contains(&tid))
             .cloned()
     }
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
+        sync_trace!("lock tasktable.map.read");
         self.map.read().unwrap().values()
             .filter(|t| *t.pgid.lock().unwrap() == pgid)
             .cloned().collect()
     }
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
         *task.pid.lock().unwrap() = pid.clone();
+        sync_trace!("lock tasktable.map.write");
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
     pub fn reap(&self, id: usize) {
+        sync_trace!("lock tasktable.map.read");
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
             {
@@ -4575,10 +4637,11 @@ impl TaskTable {
                     r.link_child(&c);
                 }
             }
+            sync_trace!("lock tasktable.map.write");
             self.map.write().unwrap().remove(&id);
         }
     }
-    pub fn count(&self) -> usize { self.map.read().unwrap().len() }
+    pub fn count(&self) -> usize { sync_trace!("lock tasktable.map.read"); self.map.read().unwrap().len() }
     pub fn fork_task(&self, src: &Arc<Task>) -> Arc<Task> {
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = src.tag();
@@ -4602,7 +4665,9 @@ impl TaskTable {
             *te = se.clone();
         }
         {
+            sync_trace!("lock task.files");
             let sf = src.files.lock().unwrap();
+            sync_trace!("lock task.files");
             let mut tf = tgt.files.lock().unwrap();
             for (&fd, fl) in sf.iter() {
                 let dup = fl.dup(false);
@@ -4633,6 +4698,7 @@ impl TaskTable {
         ctx.smask = *src.sig_mask.lock().unwrap();
         *t.thd_ctx.lock().unwrap() = Some(ctx);
         t.vm_token.store(src.vm_token.load(Ordering::Relaxed), Ordering::Relaxed);
+        sync_trace!("lock tasktable.map.write");
         self.map.write().unwrap().insert(id, t.clone());
         src.threads.lock().unwrap().push(id);
         t
@@ -4660,6 +4726,7 @@ impl TaskTable {
         let fd1 = FHandle::new("/dev/tty", FdOpt { rd: false, wr: true, ap: false, nb: false }, false, false);
         let fd2 = fd1.dup(false);
         {
+            sync_trace!("lock task.files");
             let mut fl = t.files.lock().unwrap();
             fl.insert(0, FLike::File(fd0));
             fl.insert(1, FLike::File(fd1));
@@ -4671,6 +4738,7 @@ impl TaskTable {
     }
 
     pub fn terminate_and_collect(&self, id: usize, code: usize) -> bool {
+        sync_trace!("lock tasktable.map.read");
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
             t.exit_proc(code);
@@ -4682,6 +4750,7 @@ impl TaskTable {
     }
 
     pub fn active_tasks(&self) -> Vec<usize> {
+        sync_trace!("lock tasktable.map.read");
         self.map.read().unwrap().iter()
             .filter(|(_, t)| !t.done())
             .map(|(id, _)| *id)
@@ -4689,6 +4758,7 @@ impl TaskTable {
     }
 
     pub fn zombie_tasks(&self) -> Vec<usize> {
+        sync_trace!("lock tasktable.map.read");
         self.map.read().unwrap().iter()
             .filter(|(_, t)| t.done())
             .map(|(id, _)| *id)
@@ -4981,6 +5051,10 @@ pub struct Kernel {
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
+        std::panic::set_hook(Box::new(|info| {
+            sync_trace_dump();
+            println!("{}", info);
+        }));
         Self {
             tasks: TaskTable::new(),
             cache: BlockCache::new(N_CHAINS),
@@ -4997,6 +5071,7 @@ impl Kernel {
         sync_trace!("op=tick id={}", id);
         GKL.enter(id);
         let _ir = {
+            sync_trace!("lock cpus");
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
             for (i, sl) in cg.iter().enumerate() {
@@ -5017,6 +5092,7 @@ impl Kernel {
         GKL.leave();
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
+        sync_trace!("lock cpus");
         let cg = self.cpus.lock().unwrap();
         if cpu >= cg.len() { return None; }
         match &cg[cpu] {
@@ -5029,6 +5105,7 @@ impl Kernel {
         }
     }
     pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
+        sync_trace!("lock cpus");
         let mut cg = self.cpus.lock().unwrap();
         if cpu < cg.len() {
             let _prev = cg[cpu].take();
@@ -5092,6 +5169,7 @@ impl Kernel {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
         let _caller_token = {
+            sync_trace!("lock cpus");
             let cpus = self.cpus.lock().unwrap();
             cpus.iter().enumerate().find_map(|(i, slot)| {
                 slot.as_ref().map(|t| t.vm_token.load(Ordering::Relaxed))
@@ -5209,6 +5287,7 @@ impl Kernel {
                     let fh = FHandle::open("anon", opt, _cloexec);
                     let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
+                        sync_trace!("lock task.files");
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
                         });
@@ -5407,6 +5486,7 @@ impl Kernel {
                 if old_fd == new_fd { return Ok(new_fd); }
                 let cur = self.cur_task(0);
                 if let Some(t) = cur {
+                    sync_trace!("lock task.files");
                     let mut fds = t.files.lock().unwrap();
                     let _closed_prev = fds.remove(&new_fd);
                     if let Some(fl) = fds.get(&old_fd).cloned() {
@@ -5627,6 +5707,7 @@ impl Kernel {
                             let fl = t.get_file(fd).ok_or("ebadf")?;
                             let nfl = fl.dup(false);
                             let new_fd = t.get_free_fd_from(min_fd);
+                            sync_trace!("lock task.files");
                             t.files.lock().unwrap().insert(new_fd, nfl);
                             Ok(new_fd)
                         } else {
@@ -5640,6 +5721,7 @@ impl Kernel {
                             let fl = t.get_file(fd).ok_or("ebadf")?;
                             let nfl = fl.dup(true);
                             let new_fd = t.get_free_fd_from(min_fd);
+                            sync_trace!("lock task.files");
                             t.files.lock().unwrap().insert(new_fd, nfl);
                             Ok(new_fd)
                         } else {
@@ -5938,6 +6020,7 @@ impl Kernel {
 
     pub fn balance_load(&self) -> usize {
         sync_trace!("op=balance_load");
+        sync_trace!("lock cpus");
         let cpus = self.cpus.lock().unwrap();
         let mut counts = vec![0usize; MAX_CPU];
         let mut prios = vec![0i32; MAX_CPU];
@@ -6005,12 +6088,14 @@ impl Kernel {
         let free_before = self.pool.free_count();
         if free_before < count {
             let _defrag_result = {
+                sync_trace!("lock pool.slots");
                 let mut slots = self.pool.slots.lock().unwrap();
                 defragment_frame_pool(&mut slots)
             };
         }
         for _ in 0..count {
             let pa = {
+                sync_trace!("lock pool.slots");
                 let mut s = self.pool.slots.lock().unwrap();
                 let mut found = None;
                 for (idx, f) in s.iter_mut().enumerate() {
@@ -6033,6 +6118,7 @@ impl Kernel {
         sync_trace!("op=free_pages count={}", pages.len());
         for &pa in pages {
             let idx = (pa - MEM_OFF) / PAGE_SZ;
+            sync_trace!("lock pool.slots");
             let mut s = self.pool.slots.lock().unwrap();
             if idx < s.len() {
                 let _was_free = s[idx];
@@ -6049,6 +6135,7 @@ impl Kernel {
         let used = total - free;
         let pressure = (used * 100) / total;
         let _fragmentation = {
+            sync_trace!("lock pool.slots");
             let slots = self.pool.slots.lock().unwrap();
             let mut runs = 0;
             let mut in_free = false;
@@ -6073,6 +6160,7 @@ impl Kernel {
         let parent_vm_token = parent.vm_token.load(Ordering::Relaxed);
         child.vm_token.store(parent_vm_token, Ordering::Relaxed);
         let _est_pages = {
+            sync_trace!("lock task.files");
             let files = parent.files.lock().unwrap();
             let mut total = 0usize;
             for (_, fl) in files.iter() {
@@ -6105,6 +6193,7 @@ impl Kernel {
         ];
         let _entry = validate_elf_header(&elf_data);
         {
+            sync_trace!("lock task.files");
             let fds: Vec<usize> = task.files.lock().unwrap()
                 .iter()
                 .filter_map(|(&fd, fl)| {
@@ -6115,6 +6204,7 @@ impl Kernel {
                 })
                 .collect();
             for fd in fds {
+                sync_trace!("lock task.files");
                 task.files.lock().unwrap().remove(&fd);
             }
         }
