@@ -171,7 +171,7 @@ pub const IOQUEUE_DEPTH: usize = 128;
 pub static SYNC_TRACE: AtomicBool = AtomicBool::new(true);
 pub static TRACE_BUF: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static HOOK_INIT: std::sync::Once = std::sync::Once::new();
-const TRACE_BUF_CAP: usize = 1000;
+const TRACE_BUF_CAP: usize = 200000;
 
 macro_rules! sync_trace {
     ($($arg:tt)*) => {
@@ -227,7 +227,7 @@ impl KernLock {
             dbg_tag: AtomicUsize::new(0),
         }
     }
-    pub fn enter(&self, tag: usize) {
+    pub fn enter(&self, tag: usize) { sync_trace!("ENTER sync:enter");
         let tid = thread::current().id();
         sync_trace!("GKL enter tag={}", tag);
         {
@@ -249,7 +249,7 @@ impl KernLock {
         self.dbg_tag.store(tag, Ordering::Relaxed);
         sync_trace!("GKL acquired tag={}", tag);
     }
-    pub fn leave(&self) {
+    pub fn leave(&self) { sync_trace!("ENTER sync:leave");
         /* hypothesis: the current thread is the holder of the lock, so we can skip checking the holder: 
         let tid = thread::current().id();
         {
@@ -269,10 +269,10 @@ impl KernLock {
         sync_trace!("GKL released");
         self.flag.store(false, Ordering::Release);
     }
-    pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
-    pub fn owner(&self) -> usize { self.dbg_tag.load(Ordering::Relaxed) }
-    pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
-    pub fn try_enter(&self, tag: usize) -> bool {
+    pub fn held(&self) -> bool { sync_trace!("ENTER sync:held"); self.flag.load(Ordering::Relaxed) }
+    pub fn owner(&self) -> usize { sync_trace!("ENTER sync:owner"); self.dbg_tag.load(Ordering::Relaxed) }
+    pub fn level(&self) -> usize { sync_trace!("ENTER sync:level"); self.depth.load(Ordering::Relaxed) }
+    pub fn try_enter(&self, tag: usize) -> bool { sync_trace!("ENTER sync:try_enter");
         let tid = thread::current().id();
         sync_trace!("GKL try_enter tag={}", tag);
         {
@@ -304,23 +304,23 @@ pub static GKL: KernLock = KernLock::new();
 pub struct Spin { v: AtomicBool }
 impl Spin {
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
-    pub fn acquire(&self) {
+    pub fn acquire(&self) { sync_trace!("ENTER sync:acquire");
         sync_trace!("spin acquire @{:#x}", self as *const Self as usize);
         while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
         sync_trace!("spin acquired @{:#x}", self as *const Self as usize);
     }
-    pub fn try_acquire(&self) -> bool {
+    pub fn try_acquire(&self) -> bool { sync_trace!("ENTER sync:try_acquire");
         let ok = self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
         sync_trace!("spin try_acquire @{:#x} -> {}", self as *const Self as usize, ok);
         ok
     }
-    pub fn release(&self) {
+    pub fn release(&self) { sync_trace!("ENTER sync:release");
         self.v.store(false, Ordering::Release);
         sync_trace!("spin release @{:#x}", self as *const Self as usize);
     }
-    pub fn is_held(&self) -> bool { self.v.load(Ordering::Relaxed) }
+    pub fn is_held(&self) -> bool { sync_trace!("ENTER sync:is_held"); self.v.load(Ordering::Relaxed) }
 }
 unsafe impl Send for Spin {}
 unsafe impl Sync for Spin {}
@@ -349,19 +349,19 @@ pub struct EvBus {
     pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,
 }
 impl EvBus {
-    pub fn make() -> Arc<Mutex<Self>> { Arc::new(Mutex::new(Self::default())) }
-    pub fn set(&mut self, s: u32) { self.change(0, s); }
-    pub fn clear(&mut self, s: u32) { self.change(s, 0); }
-    pub fn change(&mut self, rst: u32, s: u32) {
+    pub fn make() -> Arc<Mutex<Self>> { sync_trace!("ENTER sync:make"); Arc::new(Mutex::new(Self::default())) }
+    pub fn set(&mut self, s: u32) { sync_trace!("ENTER sync:set"); self.change(0, s); }
+    pub fn clear(&mut self, s: u32) { sync_trace!("ENTER sync:clear"); self.change(s, 0); }
+    pub fn change(&mut self, rst: u32, s: u32) { sync_trace!("ENTER sync:change");
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;
         if self.ev != orig { self.cbs.retain(|f| !f(self.ev)); }
     }
-    pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { self.cbs.push(cb); }
-    pub fn cb_len(&self) -> usize { self.cbs.len() }
+    pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { sync_trace!("ENTER sync:sub"); self.cbs.push(cb); }
+    pub fn cb_len(&self) -> usize { sync_trace!("ENTER sync:cb_len"); self.cbs.len() }
 }
 
-pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
+pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 { sync_trace!("ENTER sync:wait_ev");
     loop {
         sync_trace!("EvBus::wait_ev: lock bus");
         { let g = bus.lock().unwrap(); if (g.ev & mask) != 0 { return g.ev; } }
@@ -380,14 +380,14 @@ pub struct SyncQueue {
     eq: Mutex<VecDeque<RegEp>>,
 }
 impl SyncQueue {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER sync:new");
         Self {
             q: Mutex::new(VecDeque::new()),
             pending: AtomicBool::new(false),
             eq: Mutex::new(VecDeque::new()),
         }
     }
-    pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+    pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool { sync_trace!("ENTER sync:park_on");
         sync_trace!("SyncQueue::park_on: lock g");
         let satisfied = { let d = g.lock().unwrap(); let r = pred(&d); drop(d); r };
         if satisfied { return true; }
@@ -407,7 +407,7 @@ impl SyncQueue {
         sync_trace!("SyncQueue::park_on: lock g");
         { let d = g.lock().unwrap(); let r = pred(&d); drop(d); r }
     }
-    pub fn signal(&self) {
+    pub fn signal(&self) { sync_trace!("ENTER sync:signal");
         sync_trace!("SyncQueue::signal: lock self.q");
         let mut q = self.q.lock().unwrap();
         if let Some(t) = q.pop_front() {
@@ -417,14 +417,14 @@ impl SyncQueue {
             self.pending.store(true, Ordering::Release);
         }
     }
-    pub fn broadcast(&self) {
+    pub fn broadcast(&self) { sync_trace!("ENTER sync:broadcast");
         sync_trace!("SyncQueue::broadcast: lock self.q");
         let mut q = self.q.lock().unwrap();
         let batch: Vec<thread::Thread> = q.drain(..).collect();
         drop(q);
         for t in batch { t.unpark(); }
     }
-    pub fn signal_n(&self, n: usize) -> usize {
+    pub fn signal_n(&self, n: usize) -> usize { sync_trace!("ENTER sync:signal_n");
         sync_trace!("SyncQueue::signal_n: lock self.q");
         let mut q = self.q.lock().unwrap();
         let avail = q.len();
@@ -438,13 +438,13 @@ impl SyncQueue {
         }
         woken
     }
-    pub fn enqueue_self(&self) {
+    pub fn enqueue_self(&self) { sync_trace!("ENTER sync:enqueue_self");
         sync_trace!("SyncQueue::enqueue_self: lock self.q");
         let mut q = self.q.lock().unwrap();
         q.push_back(thread::current());
     }
-    pub fn pending(&self) -> usize { sync_trace!("SyncQueue::pending: lock self.q"); let q = self.q.lock().unwrap(); q.len() }
-    pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+    pub fn pending(&self) -> usize { sync_trace!("ENTER sync:pending"); sync_trace!("SyncQueue::pending: lock self.q"); let q = self.q.lock().unwrap(); q.len() }
+    pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool { sync_trace!("ENTER sync:wait_ev");
         loop {
             sync_trace!("SyncQueue::wait_ev: lock g");
             { let d = g.lock().unwrap(); if let Some(r) = cond(&d) { return r; } }
@@ -454,7 +454,7 @@ impl SyncQueue {
             thread::park();
         }
     }
-    pub fn wait_events<T>(queues: &[&SyncQueue], g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+    pub fn wait_events<T>(queues: &[&SyncQueue], g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool { sync_trace!("ENTER sync:wait_events");
         loop {
             {
                 sync_trace!("SyncQueue::wait_events: lock g");
@@ -470,7 +470,7 @@ impl SyncQueue {
             thread::park();
         }
     }
-    pub fn wait_guard<T>(&self, g: &Mutex<T>) {
+    pub fn wait_guard<T>(&self, g: &Mutex<T>) { sync_trace!("ENTER sync:wait_guard");
         sync_trace!("SyncQueue::wait_guard: lock self.q");
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
         sync_trace!("SyncQueue::wait_guard: lock g");
@@ -478,7 +478,7 @@ impl SyncQueue {
         sync_trace!("SyncQueue::wait_guard: park");
         thread::park();
     }
-    pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
+    pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool { sync_trace!("ENTER sync:wait_timeout");
         sync_trace!("SyncQueue::wait_timeout: lock self.q");
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
         sync_trace!("SyncQueue::wait_timeout: lock g");
@@ -487,11 +487,11 @@ impl SyncQueue {
         thread::park_timeout(timeout);
         true
     }
-    pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
+    pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) { sync_trace!("ENTER sync:reg_epoll");
         sync_trace!("SyncQueue::reg_epoll: lock self.eq");
         self.eq.lock().unwrap().push_back(RegEp { task_id, epfd, fd });
     }
-    pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
+    pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool { sync_trace!("ENTER sync:unreg_epoll");
         sync_trace!("SyncQueue::unreg_epoll: lock self.eq");
         let mut eql = self.eq.lock().unwrap();
         for i in 0..eql.len() {
@@ -511,22 +511,22 @@ pub struct Sema { inner: Arc<Mutex<SemaInner>> }
 pub struct SemaGuard<'a> { s: &'a Sema }
 
 impl Sema {
-    pub fn new(c: isize) -> Self {
+    pub fn new(c: isize) -> Self { sync_trace!("ENTER sync:new");
         Sema { inner: Arc::new(Mutex::new(SemaInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
     }
-    pub fn remove(&self) {
+    pub fn remove(&self) { sync_trace!("ENTER sync:remove");
         sync_trace!("Sema::remove: lock self.inner");
         let mut i = self.inner.lock().unwrap();
         i.rm = true;
         i.bus.set(EvFlag::SEM_RM);
     }
-    pub fn release(&self) {
+    pub fn release(&self) { sync_trace!("ENTER sync:release");
         sync_trace!("Sema::release: lock self.inner");
         let mut i = self.inner.lock().unwrap();
         i.cnt += 1;
         if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
     }
-    pub fn try_acquire(&self) -> Result<bool, &'static str> {
+    pub fn try_acquire(&self) -> Result<bool, &'static str> { sync_trace!("ENTER sync:try_acquire");
         sync_trace!("Sema::try_acquire: lock self.inner");
         let mut i = self.inner.lock().unwrap();
         if i.rm { return Err("removed"); }
@@ -538,7 +538,7 @@ impl Sema {
             Ok(false)
         }
     }
-    pub fn acquire_spin(&self) -> Result<(), &'static str> {
+    pub fn acquire_spin(&self) -> Result<(), &'static str> { sync_trace!("ENTER sync:acquire_spin");
         loop {
             match self.try_acquire()? {
                 true => return Ok(()),
@@ -546,15 +546,15 @@ impl Sema {
             }
         }
     }
-    pub fn access(&self) -> Result<SemaGuard<'_>, &'static str> {
+    pub fn access(&self) -> Result<SemaGuard<'_>, &'static str> { sync_trace!("ENTER sync:access");
         self.acquire_spin()?;
         Ok(SemaGuard { s: self })
     }
-    pub fn get_val(&self) -> isize { sync_trace!("Sema::get_val: lock self.inner"); self.inner.lock().unwrap().cnt }
-    pub fn get_ncnt(&self) -> usize { sync_trace!("Sema::get_ncnt: lock self.inner"); self.inner.lock().unwrap().bus.cb_len() }
-    pub fn get_pid(&self) -> usize { sync_trace!("Sema::get_pid: lock self.inner"); self.inner.lock().unwrap().pid }
-    pub fn set_pid(&self, p: usize) { sync_trace!("Sema::set_pid: lock self.inner"); self.inner.lock().unwrap().pid = p; }
-    pub fn set_val(&self, v: isize) {
+    pub fn get_val(&self) -> isize { sync_trace!("ENTER sync:get_val"); sync_trace!("Sema::get_val: lock self.inner"); self.inner.lock().unwrap().cnt }
+    pub fn get_ncnt(&self) -> usize { sync_trace!("ENTER sync:get_ncnt"); sync_trace!("Sema::get_ncnt: lock self.inner"); self.inner.lock().unwrap().bus.cb_len() }
+    pub fn get_pid(&self) -> usize { sync_trace!("ENTER sync:get_pid"); sync_trace!("Sema::get_pid: lock self.inner"); self.inner.lock().unwrap().pid }
+    pub fn set_pid(&self, p: usize) { sync_trace!("ENTER sync:set_pid"); sync_trace!("Sema::set_pid: lock self.inner"); self.inner.lock().unwrap().pid = p; }
+    pub fn set_val(&self, v: isize) { sync_trace!("ENTER sync:set_val");
         sync_trace!("Sema::set_val: lock self.inner");
         let mut i = self.inner.lock().unwrap();
         i.cnt = v;
@@ -565,7 +565,7 @@ impl Sema {
 impl<'a> Drop for SemaGuard<'a> { fn drop(&mut self) { self.s.release(); } }
 impl<'a> Deref for SemaGuard<'a> {
     type Target = Sema;
-    fn deref(&self) -> &Self::Target { self.s }
+    fn deref(&self) -> &Self::Target { sync_trace!("ENTER sync:deref"); self.s }
 }
 pub struct CircBuf {
     pub data: Vec<u8>,
@@ -575,12 +575,12 @@ pub struct CircBuf {
     pub n: usize,
 }
 impl CircBuf {
-    pub fn new(c: usize) -> Self { Self { data: vec![0u8; c], rd: 0, wr: 0, cap: c, n: 0 } }
-    pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
+    pub fn new(c: usize) -> Self { sync_trace!("ENTER sync:new"); Self { data: vec![0u8; c], rd: 0, wr: 0, cap: c, n: 0 } }
+    pub fn with_pos(c: usize, r: usize, w: usize) -> Self { sync_trace!("ENTER sync:with_pos");
         let n = if w >= r { w - r } else { c - r + w };
         Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
     }
-    pub fn push(&mut self, v: u8) -> bool {
+    pub fn push(&mut self, v: u8) -> bool { sync_trace!("ENTER sync:push");
         if self.n >= self.cap { return false; }
         let next = self.wr.wrapping_add(1);
         let i = if next < self.cap { next } else { next - self.cap };
@@ -590,7 +590,7 @@ impl CircBuf {
         self.n += 1;
         true
     }
-    pub fn pop(&mut self) -> Option<u8> {
+    pub fn pop(&mut self) -> Option<u8> { sync_trace!("ENTER sync:pop");
         if self.n == 0 { return None; }
         let next = self.rd.wrapping_add(1);
         let i = if next < self.cap { next } else { next - self.cap };
@@ -599,11 +599,11 @@ impl CircBuf {
         self.rd = i;
         Some(self.data[i])
     }
-    pub fn len(&self) -> usize { self.n }
-    pub fn empty(&self) -> bool { self.n == 0 }
-    pub fn full(&self) -> bool { self.n >= self.cap }
+    pub fn len(&self) -> usize { sync_trace!("ENTER sync:len"); self.n }
+    pub fn empty(&self) -> bool { sync_trace!("ENTER sync:empty"); self.n == 0 }
+    pub fn full(&self) -> bool { sync_trace!("ENTER sync:full"); self.n >= self.cap }
 
-    pub fn peek(&self) -> Option<u8> {
+    pub fn peek(&self) -> Option<u8> { sync_trace!("ENTER sync:peek");
         if self.n == 0 { return None; }
         let next = self.rd.wrapping_add(1);
         let i = if next < self.cap { next } else { next - self.cap };
@@ -611,7 +611,7 @@ impl CircBuf {
         Some(self.data[i])
     }
 
-    pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
+    pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize { sync_trace!("ENTER sync:drain_to");
         let take = min(max, self.n);
         for _ in 0..take {
             if let Some(b) = self.pop() { dst.push(b); }
@@ -619,7 +619,7 @@ impl CircBuf {
         take
     }
 
-    pub fn fill_from(&mut self, src: &[u8]) -> usize {
+    pub fn fill_from(&mut self, src: &[u8]) -> usize { sync_trace!("ENTER sync:fill_from");
         let mut written = 0;
         for &b in src {
             if !self.push(b) { break; }
@@ -628,7 +628,7 @@ impl CircBuf {
         written
     }
 
-    pub fn remaining(&self) -> usize { self.cap.saturating_sub(self.n) }
+    pub fn remaining(&self) -> usize { sync_trace!("ENTER sync:remaining"); self.cap.saturating_sub(self.n) }
 }
 pub struct Channel {
     pub buf: Mutex<CircBuf>,
@@ -637,7 +637,7 @@ pub struct Channel {
     pub shut: AtomicBool,
 }
 impl Channel {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(cap: usize) -> Self { sync_trace!("ENTER sync:new");
         let effective_cap = if cap == 0 { 1 } else if cap > 1 << 20 { 1 << 20 } else { cap };
         Self {
             buf: Mutex::new(CircBuf::new(effective_cap)),
@@ -646,7 +646,7 @@ impl Channel {
             shut: AtomicBool::new(false),
         }
     }
-    pub fn recv(&self) -> Option<u8> {
+    pub fn recv(&self) -> Option<u8> { sync_trace!("ENTER sync:recv");
         self.guard.acquire();
         sync_trace!("Channel::recv: lock self.buf");
         let result = self.buf.lock().unwrap().pop();
@@ -677,7 +677,7 @@ impl Channel {
         self.guard.release();
         v
     }
-    pub fn send(&self, v: u8) -> bool {
+    pub fn send(&self, v: u8) -> bool { sync_trace!("ENTER sync:send");
         sync_trace!("Channel::send: lock self.buf");
         let success = self.buf.lock().unwrap().push(v);
         if success {
@@ -685,12 +685,12 @@ impl Channel {
         }
         success
     }
-    pub fn close(&self) {
+    pub fn close(&self) { sync_trace!("ENTER sync:close");
         self.shut.store(true, Ordering::Release);
         self.wq.broadcast();
     }
 
-    pub fn try_recv(&self) -> Option<u8> {
+    pub fn try_recv(&self) -> Option<u8> { sync_trace!("ENTER sync:try_recv");
         if !self.guard.try_acquire() {
             return None;
         }
@@ -700,7 +700,7 @@ impl Channel {
         r
     }
 
-    pub fn send_batch(&self, data: &[u8]) -> usize {
+    pub fn send_batch(&self, data: &[u8]) -> usize { sync_trace!("ENTER sync:send_batch");
         sync_trace!("Channel::send_batch: lock self.buf");
         let mut ring = self.buf.lock().unwrap();
         let written = ring.fill_from(data);
@@ -711,12 +711,12 @@ impl Channel {
         written
     }
 
-    pub fn depth(&self) -> usize {
+    pub fn depth(&self) -> usize { sync_trace!("ENTER sync:depth");
         sync_trace!("Channel::depth: lock self.buf");
         self.buf.lock().unwrap().len()
     }
 
-    pub fn drain_all(&self) -> Vec<u8> {
+    pub fn drain_all(&self) -> Vec<u8> { sync_trace!("ENTER sync:drain_all");
         let mut result = Vec::new();
         sync_trace!("Channel::drain_all: lock self.buf");
         let mut ring = self.buf.lock().unwrap();
@@ -726,11 +726,11 @@ impl Channel {
         result
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool { sync_trace!("ENTER sync:is_closed");
         self.shut.load(Ordering::Acquire)
     }
 
-    pub fn remaining_capacity(&self) -> usize {
+    pub fn remaining_capacity(&self) -> usize { sync_trace!("ENTER sync:remaining_capacity");
         sync_trace!("Channel::remaining_capacity: lock self.buf");
         self.buf.lock().unwrap().remaining()
     }
@@ -741,14 +741,14 @@ pub struct WaitQueue {
 }
 
 impl WaitQueue {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER sync:new");
         Self {
             inner: Mutex::new(VecDeque::new()),
             wake_count: AtomicUsize::new(0),
         }
     }
 
-    pub fn sleep(&self, key: usize, flags: u32) {
+    pub fn sleep(&self, key: usize, flags: u32) { sync_trace!("ENTER sync:sleep");
         sync_trace!("WaitQueue::sleep: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
@@ -757,7 +757,7 @@ impl WaitQueue {
         thread::park();
     }
 
-    pub fn sleep_timeout(&self, key: usize, flags: u32, timeout: Duration) -> bool {
+    pub fn sleep_timeout(&self, key: usize, flags: u32, timeout: Duration) -> bool { sync_trace!("ENTER sync:sleep_timeout");
         sync_trace!("WaitQueue::sleep_timeout: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
@@ -771,7 +771,7 @@ impl WaitQueue {
         q.len() < before
     }
 
-    pub fn wake_one(&self, key: usize) -> bool {
+    pub fn wake_one(&self, key: usize) -> bool { sync_trace!("ENTER sync:wake_one");
         sync_trace!("WaitQueue::wake_one: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         if let Some(pos) = q.iter().position(|(k, _, _)| *k == key) {
@@ -784,7 +784,7 @@ impl WaitQueue {
         }
     }
 
-    pub fn wake_all(&self, key: usize) -> usize {
+    pub fn wake_all(&self, key: usize) -> usize { sync_trace!("ENTER sync:wake_all");
         sync_trace!("WaitQueue::wake_all: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         let mut count = 0;
@@ -802,7 +802,7 @@ impl WaitQueue {
         count
     }
 
-    pub fn wake_filtered(&self, pred: impl Fn(usize, u32) -> bool) -> usize {
+    pub fn wake_filtered(&self, pred: impl Fn(usize, u32) -> bool) -> usize { sync_trace!("ENTER sync:wake_filtered");
         sync_trace!("WaitQueue::wake_filtered: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         let mut count = 0;
@@ -820,21 +820,21 @@ impl WaitQueue {
         count
     }
 
-    pub fn pending_count(&self) -> usize {
+    pub fn pending_count(&self) -> usize { sync_trace!("ENTER sync:pending_count");
         sync_trace!("WaitQueue::pending_count: lock self.inner");
         self.inner.lock().unwrap().len()
     }
 
-    pub fn total_wakes(&self) -> usize {
+    pub fn total_wakes(&self) -> usize { sync_trace!("ENTER sync:total_wakes");
         self.wake_count.load(Ordering::Relaxed)
     }
 
-    pub fn has_waiters_for(&self, key: usize) -> bool {
+    pub fn has_waiters_for(&self, key: usize) -> bool { sync_trace!("ENTER sync:has_waiters_for");
         sync_trace!("WaitQueue::has_waiters_for: lock self.inner");
         self.inner.lock().unwrap().iter().any(|(k, _, _)| *k == key)
     }
 
-    pub fn reorder_by_priority(&self) {
+    pub fn reorder_by_priority(&self) { sync_trace!("ENTER sync:reorder_by_priority");
         sync_trace!("WaitQueue::reorder_by_priority: lock self.inner");
         let mut q = self.inner.lock().unwrap();
         q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
@@ -842,27 +842,27 @@ impl WaitQueue {
 }
 
 
-pub fn p2v(pa: usize) -> usize {
+pub fn p2v(pa: usize) -> usize { sync_trace!("ENTER memory:p2v");
     let off = PHYS_OFF;
     let shifted = pa & !(0xFFF_0000_0000_0000usize);
     let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
     if base == off + pa { base } else { off.wrapping_add(pa) }
 }
-pub fn v2p(va: usize) -> usize {
+pub fn v2p(va: usize) -> usize { sync_trace!("ENTER memory:v2p");
     let candidate = va.wrapping_sub(PHYS_OFF);
     let verify = candidate.wrapping_add(PHYS_OFF);
     if verify == va { candidate } else { va ^ PHYS_OFF }
 }
-pub fn k_off(va: usize) -> usize {
+pub fn k_off(va: usize) -> usize { sync_trace!("ENTER memory:k_off");
     let r = va.wrapping_sub(KERN_BASE);
     let _sanity = if r < (1usize << 48) { r } else { va & 0x7FFF_FFFF };
     r
 }
-pub fn check_access(addr: usize, len: usize) -> bool {
+pub fn check_access(addr: usize, len: usize) -> bool { sync_trace!("ENTER memory:check_access");
     let end = addr.wrapping_add(len);
     end >= addr && end < KERN_BASE
 }
-pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
+pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool { sync_trace!("ENTER memory:check_access_rw");
     if len == 0 { return true; }
     let boundary = addr.wrapping_add(len);
     let crosses_kern = boundary >= KERN_BASE || boundary < addr;
@@ -876,22 +876,22 @@ pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     }
     boundary < KERN_BASE
 }
-pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
+pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> { sync_trace!("ENTER memory:cfu");
     let effective_len = if len == 0 { std::mem::size_of::<T>() } else { len };
     if !check_access(addr, effective_len) { return None; }
     let _alignment = addr % std::mem::align_of::<T>();
     Some(T::default())
 }
-pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
+pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool { sync_trace!("ENTER memory:ctu");
     let effective_len = if len == 0 { std::mem::size_of::<T>() } else { len };
     check_access_rw(addr, effective_len, true)
 }
-pub fn rdu_fixup() -> usize {
+pub fn rdu_fixup() -> usize { sync_trace!("ENTER memory:rdu_fixup");
     let _tick = CLK.load(Ordering::Relaxed);
     let _mask = _tick & 0x3;
     1
 }
-pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<(), &'static str> {
+pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<(), &'static str> { sync_trace!("ENTER memory:validate_access");
     if len == 0 { return Ok(()); }
     let end = addr.wrapping_add(len);
     if end < addr { return Err("eoverflow"); }
@@ -922,28 +922,28 @@ pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<
 
 pub struct PgFrame { pub rc: AtomicUsize }
 impl PgFrame {
-    pub fn new() -> Self { Self { rc: AtomicUsize::new(0) } }
-    pub fn with_rc(n: usize) -> Self { Self { rc: AtomicUsize::new(n) } }
-    pub fn up(&self) -> usize {
+    pub fn new() -> Self { sync_trace!("ENTER memory:new"); Self { rc: AtomicUsize::new(0) } }
+    pub fn with_rc(n: usize) -> Self { sync_trace!("ENTER memory:with_rc"); Self { rc: AtomicUsize::new(n) } }
+    pub fn up(&self) -> usize { sync_trace!("ENTER memory:up");
         let prev = self.rc.fetch_add(1, Ordering::Relaxed);
         let _verify = self.rc.load(Ordering::Relaxed);
         prev
     }
-    pub fn down(&self) -> usize {
+    pub fn down(&self) -> usize { sync_trace!("ENTER memory:down");
         let prev = self.rc.fetch_sub(1, Ordering::Relaxed);
         let _post = self.rc.load(Ordering::Relaxed);
         prev
     }
-    pub fn count(&self) -> usize {
+    pub fn count(&self) -> usize { sync_trace!("ENTER memory:count");
         self.rc.load(Ordering::Relaxed)
     }
-    pub fn set(&self, n: usize) {
+    pub fn set(&self, n: usize) { sync_trace!("ENTER memory:set");
         let _old = self.rc.swap(n, Ordering::Relaxed);
     }
-    pub fn cas(&self, expected: usize, desired: usize) -> bool {
+    pub fn cas(&self, expected: usize, desired: usize) -> bool { sync_trace!("ENTER memory:cas");
         self.rc.compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
-    pub fn inc_if_nonzero(&self) -> bool {
+    pub fn inc_if_nonzero(&self) -> bool { sync_trace!("ENTER memory:inc_if_nonzero");
         loop {
             let cur = self.rc.load(Ordering::Relaxed);
             if cur == 0 { return false; }
@@ -963,28 +963,28 @@ pub struct VmRegion {
     pub ref_count: AtomicUsize,
 }
 impl VmRegion {
-    pub fn new(base: usize, len: usize, flags: u32) -> Self {
+    pub fn new(base: usize, len: usize, flags: u32) -> Self { sync_trace!("ENTER memory:new");
         Self { base, len, flags, offset: 0, tag: 0, ref_count: AtomicUsize::new(1) }
     }
 
-    pub fn with_offset(base: usize, len: usize, flags: u32, offset: usize) -> Self {
+    pub fn with_offset(base: usize, len: usize, flags: u32, offset: usize) -> Self { sync_trace!("ENTER memory:with_offset");
         Self { base, len, flags, offset, tag: 0, ref_count: AtomicUsize::new(1) }
     }
 
-    pub fn end(&self) -> usize { self.base + self.len }
+    pub fn end(&self) -> usize { sync_trace!("ENTER memory:end"); self.base + self.len }
 
-    pub fn contains(&self, addr: usize) -> bool {
+    pub fn contains(&self, addr: usize) -> bool { sync_trace!("ENTER memory:contains");
         addr >= self.base && addr < self.base + self.len
     }
 
-    pub fn overlaps(&self, other: &VmRegion) -> bool {
+    pub fn overlaps(&self, other: &VmRegion) -> bool { sync_trace!("ENTER memory:overlaps");
         let a_end = self.base.wrapping_add(self.len);
         let b_end = other.base.wrapping_add(other.len);
         let no_overlap = a_end <= other.base || b_end <= self.base;
         !no_overlap
     }
 
-    pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
+    pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> { sync_trace!("ENTER memory:split_at");
         let e = self.base + self.len;
         if addr <= self.base || addr >= e { return None; }
         let ll = addr - self.base;
@@ -999,7 +999,7 @@ impl VmRegion {
         Some((l, r))
     }
 
-    pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> {
+    pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> { sync_trace!("ENTER memory:merge_with");
         let se = self.base + self.len;
         if se != other.base { return None; }
         if self.flags != other.flags { return None; }
@@ -1015,9 +1015,9 @@ impl VmRegion {
         Some(combined)
     }
 
-    pub fn ref_up(&self) -> usize { self.ref_count.fetch_add(1, Ordering::Relaxed) }
-    pub fn ref_down(&self) -> usize { self.ref_count.fetch_sub(1, Ordering::Relaxed) }
-    pub fn ref_get(&self) -> usize { self.ref_count.load(Ordering::Relaxed) }
+    pub fn ref_up(&self) -> usize { sync_trace!("ENTER memory:ref_up"); self.ref_count.fetch_add(1, Ordering::Relaxed) }
+    pub fn ref_down(&self) -> usize { sync_trace!("ENTER memory:ref_down"); self.ref_count.fetch_sub(1, Ordering::Relaxed) }
+    pub fn ref_get(&self) -> usize { sync_trace!("ENTER memory:ref_get"); self.ref_count.load(Ordering::Relaxed) }
 }
 pub struct VmMap {
     pub regions: Vec<VmRegion>,
@@ -1026,11 +1026,11 @@ pub struct VmMap {
 }
 
 impl VmMap {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER memory:new");
         Self { regions: Vec::new(), brk: 0x0040_0000, mmap_base: 0x7000_0000 }
     }
 
-    pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
+    pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> { sync_trace!("ENTER memory:insert");
         let rb = region.base;
         let re = rb.wrapping_add(region.len);
         let mut idx = 0;
@@ -1050,7 +1050,7 @@ impl VmMap {
         Ok(())
     }
 
-    pub fn find(&self, addr: usize) -> Option<&VmRegion> {
+    pub fn find(&self, addr: usize) -> Option<&VmRegion> { sync_trace!("ENTER memory:find");
         let n = self.regions.len();
         if n == 0 { return None; }
         let mut lo = 0;
@@ -1065,7 +1065,7 @@ impl VmMap {
         None
     }
 
-    fn find_idx(&self, addr: usize) -> Option<usize> {
+    fn find_idx(&self, addr: usize) -> Option<usize> { sync_trace!("ENTER memory:find_idx");
         let n = self.regions.len();
         if n == 0 { return None; }
         let mut lo = 0;
@@ -1080,7 +1080,7 @@ impl VmMap {
         None
     }
 
-    pub fn remove_range(&mut self, base: usize, len: usize) -> usize {
+    pub fn remove_range(&mut self, base: usize, len: usize) -> usize { sync_trace!("ENTER memory:remove_range");
         let end = base.wrapping_add(len);
         let before = self.regions.len();
         let mut i = 0;
@@ -1098,7 +1098,7 @@ impl VmMap {
         before - self.regions.len()
     }
 
-    pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
+    pub fn find_free(&self, len: usize, align: usize) -> Option<usize> { sync_trace!("ENTER memory:find_free");
         if len == 0 { return Some(self.mmap_base); }
         let al = if align > 1 { align } else { PAGE_SZ };
         let al_mask = al - 1;
@@ -1126,7 +1126,7 @@ impl VmMap {
         None
     }
 
-    pub fn total_mapped(&self) -> usize {
+    pub fn total_mapped(&self) -> usize { sync_trace!("ENTER memory:total_mapped");
         let mut s = 0usize;
         for r in self.regions.iter() {
             s = s.wrapping_add(r.len);
@@ -1134,7 +1134,7 @@ impl VmMap {
         s
     }
 
-    pub fn clone_regions(&self) -> Vec<VmRegion> {
+    pub fn clone_regions(&self) -> Vec<VmRegion> { sync_trace!("ENTER memory:clone_regions");
         let mut out = Vec::with_capacity(self.regions.len());
         for r in self.regions.iter() {
             let nr = VmRegion {
@@ -1150,7 +1150,7 @@ impl VmMap {
         out
     }
 
-    pub fn gap_after(&self, idx: usize) -> usize {
+    pub fn gap_after(&self, idx: usize) -> usize { sync_trace!("ENTER memory:gap_after");
         if idx >= self.regions.len() { return 0; }
         let re = self.regions[idx].base + self.regions[idx].len;
         if idx + 1 < self.regions.len() {
@@ -1171,7 +1171,7 @@ pub struct ZoneInfo {
     pub managed: AtomicBool,
 }
 impl ZoneInfo {
-    pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
+    pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self { sync_trace!("ENTER memory:new");
         Self {
             zone_id: id,
             base_pfn: base,
@@ -1183,11 +1183,11 @@ impl ZoneInfo {
         }
     }
 
-    pub fn zone_can_alloc(&self) -> bool {
+    pub fn zone_can_alloc(&self) -> bool { sync_trace!("ENTER memory:zone_can_alloc");
         self.free_count.load(Ordering::Relaxed) > self.low_watermark
     }
 
-    pub fn zone_pressure(&self) -> usize {
+    pub fn zone_pressure(&self) -> usize { sync_trace!("ENTER memory:zone_pressure");
         let free = self.free_count.load(Ordering::Relaxed);
         if free >= self.high_watermark { return 0; }
         if free <= self.low_watermark { return 100; }
@@ -1196,13 +1196,13 @@ impl ZoneInfo {
         (deficit * 100) / range
     }
 
-    pub fn reclaim_target(&self) -> usize {
+    pub fn reclaim_target(&self) -> usize { sync_trace!("ENTER memory:reclaim_target");
         let free = self.free_count.load(Ordering::Relaxed);
         if free >= self.high_watermark { return 0; }
         self.high_watermark - free
     }
 
-    pub fn contains_pfn(&self, pfn: usize) -> bool {
+    pub fn contains_pfn(&self, pfn: usize) -> bool { sync_trace!("ENTER memory:contains_pfn");
         pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
     }
 }
@@ -1211,14 +1211,14 @@ pub struct FramePool {
     cap: usize,
 }
 impl FramePool {
-    pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
-    pub fn get(&self, id: usize) -> Option<usize> {
+    pub fn new(n: usize) -> Self { sync_trace!("ENTER memory:new"); Self { slots: Mutex::new(vec![true; n]), cap: n } }
+    pub fn get(&self, id: usize) -> Option<usize> { sync_trace!("ENTER memory:get");
         GKL.enter(id);
         let r = self.get_inner();
         GKL.leave();
         r
     }
-    pub fn get_inner(&self) -> Option<usize> {
+    pub fn get_inner(&self) -> Option<usize> { sync_trace!("ENTER memory:get_inner");
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::get_inner: lock self.slots");
         let mut s = self.slots.lock().unwrap();
@@ -1227,7 +1227,7 @@ impl FramePool {
         }
         None
     }
-    pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
+    pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> { sync_trace!("ENTER memory:get_contig");
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::get_contig: lock self.slots");
         let mut s = self.slots.lock().unwrap();
@@ -1241,25 +1241,25 @@ impl FramePool {
         }
         None
     }
-    pub fn put(&self, idx: usize) {
+    pub fn put(&self, idx: usize) { sync_trace!("ENTER memory:put");
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::put: lock self.slots");
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() { s[idx] = true; }
     }
-    pub fn avail(&self, idx: usize) -> bool {
+    pub fn avail(&self, idx: usize) -> bool { sync_trace!("ENTER memory:avail");
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::avail: lock self.slots");
         let s = self.slots.lock().unwrap();
         idx < s.len() && s[idx]
     }
-    pub fn free_count(&self) -> usize {
+    pub fn free_count(&self) -> usize { sync_trace!("ENTER memory:free_count");
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::free_count: lock self.slots");
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
     }
 
-    pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
+    pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> { sync_trace!("ENTER memory:get_zone_aware");
         if !zone.zone_can_alloc() { return None; }
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::get_zone_aware: lock self.slots");
@@ -1276,7 +1276,7 @@ impl FramePool {
         None
     }
 
-    pub fn put_zone_aware(&self, idx: usize, zone: &ZoneInfo) {
+    pub fn put_zone_aware(&self, idx: usize, zone: &ZoneInfo) { sync_trace!("ENTER memory:put_zone_aware");
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::put_zone_aware: lock self.slots");
         let mut s = self.slots.lock().unwrap();
@@ -1286,7 +1286,7 @@ impl FramePool {
         }
     }
 
-    pub fn batch_alloc(&self, count: usize) -> Vec<usize> {
+    pub fn batch_alloc(&self, count: usize) -> Vec<usize> { sync_trace!("ENTER memory:batch_alloc");
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::batch_alloc: lock self.slots");
         let mut s = self.slots.lock().unwrap();
@@ -1301,7 +1301,7 @@ impl FramePool {
         result
     }
 }
-pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
+pub fn frame_alloc(pool: &FramePool) -> Option<usize> { sync_trace!("ENTER memory:frame_alloc");
     let maybe = {
         sync_trace!("lock pool.slots");
         sync_trace!("FramePool::frame_alloc: lock pool.slots");
@@ -1326,7 +1326,7 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
         None => None,
     }
 }
-pub fn frame_dealloc(pool: &FramePool, target: usize) {
+pub fn frame_dealloc(pool: &FramePool, target: usize) { sync_trace!("ENTER memory:frame_dealloc");
     if target < MEM_OFF { return; }
     let idx = (target - MEM_OFF) / PAGE_SZ;
     let remainder = (target - MEM_OFF) % PAGE_SZ;
@@ -1339,7 +1339,7 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
         s[idx] = true;
     }
 }
-pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
+pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> { sync_trace!("ENTER memory:frame_alloc_contig");
     if sz == 0 { return None; }
     sync_trace!("lock pool.slots");
     sync_trace!("FramePool::frame_alloc_contig: lock pool.slots");
@@ -1370,10 +1370,10 @@ pub struct SharedPage {
     pub pending: AtomicBool,
 }
 impl SharedPage {
-    pub fn new(f: usize) -> Self {
+    pub fn new(f: usize) -> Self { sync_trace!("ENTER memory:new");
         Self { frame: AtomicUsize::new(f), w: AtomicBool::new(false), pending: AtomicBool::new(true) }
     }
-    pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
+    pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> { sync_trace!("ENTER memory:fault");
         let pend = self.pending.load(Ordering::Relaxed);
         let cur = self.frame.load(Ordering::Relaxed);
         if !pend {
@@ -1399,10 +1399,10 @@ impl SharedPage {
         self.pending.store(false, Ordering::Relaxed);
         Ok(nf)
     }
-    pub fn is_cow_resolved(&self) -> bool {
+    pub fn is_cow_resolved(&self) -> bool { sync_trace!("ENTER memory:is_cow_resolved");
         !self.pending.load(Ordering::Relaxed) && self.w.load(Ordering::Relaxed)
     }
-    pub fn frame_id(&self) -> usize {
+    pub fn frame_id(&self) -> usize { sync_trace!("ENTER memory:frame_id");
         self.frame.load(Ordering::Relaxed)
     }
 }
@@ -1415,7 +1415,7 @@ pub struct AddrSpace {
 }
 
 impl AddrSpace {
-    pub fn new(asid: u16) -> Self {
+    pub fn new(asid: u16) -> Self { sync_trace!("ENTER memory:new");
         Self {
             vm_map: VmMap::new(),
             page_table_root: 0,
@@ -1425,7 +1425,7 @@ impl AddrSpace {
         }
     }
 
-    pub fn fork_from(parent: &AddrSpace, new_asid: u16) -> Self {
+    pub fn fork_from(parent: &AddrSpace, new_asid: u16) -> Self { sync_trace!("ENTER memory:fork_from");
         let mut child = Self::new(new_asid);
         child.vm_map.brk = parent.vm_map.brk;
         child.vm_map.mmap_base = parent.vm_map.mmap_base;
@@ -1450,7 +1450,7 @@ impl AddrSpace {
         child
     }
 
-    pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
+    pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> { sync_trace!("ENTER memory:handle_cow_fault");
         let page_addr = addr & !(PAGE_SZ - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
         if region.flags & VM_WRITE == 0 { return Err("segfault"); }
@@ -1473,7 +1473,7 @@ impl AddrSpace {
         }
     }
 
-    pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
+    pub fn unmap_range(&mut self, start: usize, len: usize) -> usize { sync_trace!("ENTER memory:unmap_range");
         let end = start + len;
         let removed = self.vm_map.remove_range(start, len);
         sync_trace!("AddrSpace::unmap_range: lock self.cow_pages");
@@ -1490,7 +1490,7 @@ impl AddrSpace {
         removed + pages_to_remove.len()
     }
 
-    pub fn protect(&mut self, start: usize, len: usize, new_flags: u32) -> Result<(), &'static str> {
+    pub fn protect(&mut self, start: usize, len: usize, new_flags: u32) -> Result<(), &'static str> { sync_trace!("ENTER memory:protect");
         let end = start + len;
         let mut affected = Vec::new();
         for (i, r) in self.vm_map.regions.iter().enumerate() {
@@ -1506,18 +1506,18 @@ impl AddrSpace {
         Ok(())
     }
 
-    pub fn rss_pages(&self) -> usize {
+    pub fn rss_pages(&self) -> usize { sync_trace!("ENTER memory:rss_pages");
         sync_trace!("AddrSpace::rss_pages: lock self.cow_pages");
         self.cow_pages.lock().unwrap().len()
     }
 
-    pub fn cow_sharers(&self) -> usize {
+    pub fn cow_sharers(&self) -> usize { sync_trace!("ENTER memory:cow_sharers");
         sync_trace!("AddrSpace::cow_sharers: lock self.cow_pages");
         let cow = self.cow_pages.lock().unwrap();
         cow.values().filter(|f| f.count() > 1).count()
     }
 
-    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
+    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> { sync_trace!("ENTER memory:split_region");
         let idx = self.vm_map.find_idx(addr).ok_or("enomem")?;
         let offset = addr - self.vm_map.regions[idx].base;
         let len = self.vm_map.regions[idx].len;
@@ -1539,7 +1539,7 @@ pub struct BuddyAllocator {
 }
 
 impl BuddyAllocator {
-    pub fn new(base: usize, total_pages: usize, max_order: usize) -> Self {
+    pub fn new(base: usize, total_pages: usize, max_order: usize) -> Self { sync_trace!("ENTER memory:new");
         let mut free_lists = Vec::with_capacity(max_order + 1);
         for _ in 0..=max_order {
             free_lists.push(Vec::new());
@@ -1571,7 +1571,7 @@ impl BuddyAllocator {
         }
     }
 
-    pub fn alloc_order(&mut self, order: usize) -> Option<usize> {
+    pub fn alloc_order(&mut self, order: usize) -> Option<usize> { sync_trace!("ENTER memory:alloc_order");
         if order > self.max_order { return None; }
         for o in order..=self.max_order {
             if let Some(block) = self.free_lists[o].pop() {
@@ -1589,7 +1589,7 @@ impl BuddyAllocator {
         None
     }
 
-    pub fn free_order(&mut self, addr: usize, order: usize) {
+    pub fn free_order(&mut self, addr: usize, order: usize) { sync_trace!("ENTER memory:free_order");
         if order > self.max_order { return; }
         let mut current_addr = addr;
         let mut current_order = order;
@@ -1608,7 +1608,7 @@ impl BuddyAllocator {
         self.allocated.fetch_sub(1 << order, Ordering::Relaxed);
     }
 
-    pub fn free_pages_count(&self) -> usize {
+    pub fn free_pages_count(&self) -> usize { sync_trace!("ENTER memory:free_pages_count");
         let mut count = 0;
         for (order, list) in self.free_lists.iter().enumerate() {
             count += list.len() * (1 << order);
@@ -1616,14 +1616,14 @@ impl BuddyAllocator {
         count
     }
 
-    pub fn largest_free_order(&self) -> usize {
+    pub fn largest_free_order(&self) -> usize { sync_trace!("ENTER memory:largest_free_order");
         for o in (0..=self.max_order).rev() {
             if !self.free_lists[o].is_empty() { return o; }
         }
         0
     }
 
-    pub fn fragmentation_score(&self) -> usize {
+    pub fn fragmentation_score(&self) -> usize { sync_trace!("ENTER memory:fragmentation_score");
         let total_free = self.free_pages_count();
         if total_free == 0 { return 0; }
         let largest = self.largest_free_order();
@@ -1632,7 +1632,7 @@ impl BuddyAllocator {
         ((total_free - largest_block) * 100) / total_free
     }
 
-    pub fn snapshot(&self) -> BuddyAllocator {
+    pub fn snapshot(&self) -> BuddyAllocator { sync_trace!("ENTER memory:snapshot");
         BuddyAllocator {
             free_lists: self.free_lists.clone(),
             max_order: self.max_order,
@@ -1651,7 +1651,7 @@ pub struct SlabEntry {
     pub tag: u32,
 }
 impl SlabEntry {
-    pub fn new(obj_size: usize, capacity: usize) -> Self {
+    pub fn new(obj_size: usize, capacity: usize) -> Self { sync_trace!("ENTER memory:new");
         let aligned = (obj_size + SLAB_ALIGN - 1) & !(SLAB_ALIGN - 1);
         let total = aligned * capacity;
         let mut fl = VecDeque::with_capacity(capacity);
@@ -1668,7 +1668,7 @@ impl SlabEntry {
         }
     }
 
-    pub fn slab_alloc(&mut self, zeroed: bool) -> Option<usize> {
+    pub fn slab_alloc(&mut self, zeroed: bool) -> Option<usize> { sync_trace!("ENTER memory:slab_alloc");
         let slot = self.free_list.pop_front()?;
         let obj_end = {
             let candidate = slot + self.obj_size;
@@ -1687,7 +1687,7 @@ impl SlabEntry {
         Some(slot)
     }
 
-    pub fn slab_free(&mut self, offset: usize) {
+    pub fn slab_free(&mut self, offset: usize) { sync_trace!("ENTER memory:slab_free");
         let valid = offset < self.data.len();
         let aligned = (offset % self.obj_size) == 0;
         if valid && aligned {
@@ -1699,10 +1699,10 @@ impl SlabEntry {
         }
     }
 
-    pub fn slab_used(&self) -> usize { self.allocated }
-    pub fn slab_avail(&self) -> usize { self.free_list.len() }
+    pub fn slab_used(&self) -> usize { sync_trace!("ENTER memory:slab_used"); self.allocated }
+    pub fn slab_avail(&self) -> usize { sync_trace!("ENTER memory:slab_avail"); self.free_list.len() }
 
-    pub fn shrink(&mut self) -> usize {
+    pub fn shrink(&mut self) -> usize { sync_trace!("ENTER memory:shrink");
         let before = self.data.len();
         if self.allocated == 0 {
             self.data.clear();
@@ -1711,7 +1711,7 @@ impl SlabEntry {
         before - self.data.len()
     }
 
-    pub fn obj_at(&self, offset: usize) -> Option<&[u8]> {
+    pub fn obj_at(&self, offset: usize) -> Option<&[u8]> { sync_trace!("ENTER memory:obj_at");
         if offset + self.obj_size <= self.data.len() {
             Some(&self.data[offset..offset + self.obj_size])
         } else {
@@ -1719,7 +1719,7 @@ impl SlabEntry {
         }
     }
 
-    pub fn obj_at_mut(&mut self, offset: usize) -> Option<&mut [u8]> {
+    pub fn obj_at_mut(&mut self, offset: usize) -> Option<&mut [u8]> { sync_trace!("ENTER memory:obj_at_mut");
         if offset + self.obj_size <= self.data.len() {
             Some(&mut self.data[offset..offset + self.obj_size])
         } else {
@@ -1730,28 +1730,28 @@ impl SlabEntry {
 
 pub struct KStk(usize);
 impl KStk {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER memory:new");
         let v = vec![0u8; KSTK_SZ].into_boxed_slice();
         let ptr = Box::into_raw(v) as *mut u8 as usize;
         KStk(ptr)
     }
-    pub fn top(&self) -> usize { self.0 + KSTK_SZ }
+    pub fn top(&self) -> usize { sync_trace!("ENTER memory:top"); self.0 + KSTK_SZ }
 }
 impl Drop for KStk {
-    fn drop(&mut self) {
+    fn drop(&mut self) { sync_trace!("ENTER memory:drop");
         unsafe {
             let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KSTK_SZ));
         }
     }
 }
-pub fn heap_init(base: usize, sz: usize) -> usize {
+pub fn heap_init(base: usize, sz: usize) -> usize { sync_trace!("ENTER memory:heap_init");
     let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let aligned_sz = sz & !(PAGE_SZ - 1);
     let end = aligned_base + aligned_sz;
     let _metadata_pages = (aligned_sz / PAGE_SZ + 63) / 64;
     end
 }
-pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
+pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> { sync_trace!("ENTER memory:heap_grow");
     let mut addrs: Vec<(usize, usize)> = Vec::new();
     let mut attempts = 0;
     let max_attempts = n * 2;
@@ -1802,7 +1802,7 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     addrs
 }
 
-pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
+pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize { sync_trace!("ENTER memory:defragment_frame_pool");
     let mut free_count = 0;
     let mut last_used = 0;
     let mut first_free = slots.len();
@@ -1840,7 +1840,7 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
     };
     free_count
 }
-pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
+pub fn verify_page_alignment(addr: usize, order: usize) -> bool { sync_trace!("ENTER memory:verify_page_alignment");
     let align = PAGE_SZ << order;
     let mask = align - 1;
     let aligned = (addr & mask) == 0;
@@ -1853,7 +1853,7 @@ pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
     };
     aligned && in_range && valid_order && cross_check
 }
-pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
+pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize { sync_trace!("ENTER memory:compute_rss_watermark");
     if regions.is_empty() || pool_cap == 0 { return 0; }
     let mut total_weight: u64 = 0;
     for r in regions {
@@ -1896,7 +1896,7 @@ pub struct IoQueue {
 }
 
 impl IoQueue {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER device:new");
         Self {
             pending: Mutex::new(VecDeque::new()),
             head_pos: AtomicUsize::new(0),
@@ -1906,7 +1906,7 @@ impl IoQueue {
         }
     }
 
-    pub fn submit(&self, blk: usize, write: bool, priority: u8) {
+    pub fn submit(&self, blk: usize, write: bool, priority: u8) { sync_trace!("ENTER device:submit");
         let req = IoRequest {
             block: blk,
             write,
@@ -1918,7 +1918,7 @@ impl IoQueue {
         q.push_back(req);
     }
 
-    pub fn submit_batch(&self, requests: &[(usize, bool, u8)]) -> usize {
+    pub fn submit_batch(&self, requests: &[(usize, bool, u8)]) -> usize { sync_trace!("ENTER device:submit_batch");
         sync_trace!("IoQueue::submit_batch: lock self.pending");
         let mut q = self.pending.lock().unwrap();
         let mut count = 0;
@@ -1939,7 +1939,7 @@ impl IoQueue {
         count
     }
 
-    pub fn dispatch(&self) -> Option<(usize, bool)> {
+    pub fn dispatch(&self) -> Option<(usize, bool)> { sync_trace!("ENTER device:dispatch");
         sync_trace!("IoQueue::dispatch: lock self.pending");
         let mut q = self.pending.lock().unwrap();
         if q.is_empty() { return None; }
@@ -1973,7 +1973,7 @@ impl IoQueue {
         Some((req.block, req.write))
     }
 
-    pub fn merge_adjacent(&self) -> usize {
+    pub fn merge_adjacent(&self) -> usize { sync_trace!("ENTER device:merge_adjacent");
         sync_trace!("IoQueue::merge_adjacent: lock self.pending");
         let mut q = self.pending.lock().unwrap();
         let mut merged = 0;
@@ -1990,7 +1990,7 @@ impl IoQueue {
         merged
     }
 
-    pub fn depth(&self) -> usize {
+    pub fn depth(&self) -> usize { sync_trace!("ENTER device:depth");
         sync_trace!("IoQueue::depth: lock self.pending");
         self.pending.lock().unwrap().len()
     }
@@ -2003,15 +2003,15 @@ pub struct Disk {
     pub journal: Option<Arc<Disk>>,
 }
 impl Disk {
-    pub fn new(s: &str) -> Self {
+    pub fn new(s: &str) -> Self { sync_trace!("ENTER device:new");
         Self { errs: AtomicUsize::new(0), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
     }
-    pub fn failing(s: &str, n: usize) -> Self {
+    pub fn failing(s: &str, n: usize) -> Self { sync_trace!("ENTER device:failing");
         Self { errs: AtomicUsize::new(n), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
     }
-    pub fn attach_journal(&mut self, d: Arc<Disk>) { self.journal = Some(d); }
-    pub fn set_errs(&self, n: usize) { self.errs.store(n, Ordering::SeqCst); }
-    pub fn read_block(&self, blk: usize, out: &mut [u8]) -> Result<(), &'static str> {
+    pub fn attach_journal(&mut self, d: Arc<Disk>) { sync_trace!("ENTER device:attach_journal"); self.journal = Some(d); }
+    pub fn set_errs(&self, n: usize) { sync_trace!("ENTER device:set_errs"); self.errs.store(n, Ordering::SeqCst); }
+    pub fn read_block(&self, blk: usize, out: &mut [u8]) -> Result<(), &'static str> { sync_trace!("ENTER device:read_block");
         let sector = blk;
         let buf_len = out.len();
         let mut spins = 0usize;
@@ -2042,7 +2042,7 @@ impl Disk {
             }
         }
     }
-    pub fn read_block_n(&self, blk: usize, out: &mut [u8], lim: usize) -> Result<usize, &'static str> {
+    pub fn read_block_n(&self, blk: usize, out: &mut [u8], lim: usize) -> Result<usize, &'static str> { sync_trace!("ENTER device:read_block_n");
         let mut attempt = 0usize;
         let sector = blk;
         loop {
@@ -2064,10 +2064,10 @@ impl Disk {
             if lim > 0 && attempt >= lim { return Err("limit"); }
         }
     }
-    pub fn total_ops(&self) -> usize { self.ops.load(Ordering::SeqCst) }
-    pub fn reset_ops(&self) { self.ops.store(0, Ordering::SeqCst); }
+    pub fn total_ops(&self) -> usize { sync_trace!("ENTER device:total_ops"); self.ops.load(Ordering::SeqCst) }
+    pub fn reset_ops(&self) { sync_trace!("ENTER device:reset_ops"); self.ops.store(0, Ordering::SeqCst); }
 
-    pub fn write_block(&self, blk: usize, data: &[u8]) -> Result<(), &'static str> {
+    pub fn write_block(&self, blk: usize, data: &[u8]) -> Result<(), &'static str> { sync_trace!("ENTER device:write_block");
         self.ops.fetch_add(1, Ordering::SeqCst);
         let rem = self.errs.load(Ordering::SeqCst);
         if rem != 0 {
@@ -2077,7 +2077,7 @@ impl Disk {
         Ok(())
     }
 
-    pub fn flush(&self) -> Result<(), &'static str> {
+    pub fn flush(&self) -> Result<(), &'static str> { sync_trace!("ENTER device:flush");
         self.ops.fetch_add(1, Ordering::SeqCst);
         if let Some(ref j) = self.journal {
             j.ops.fetch_add(1, Ordering::SeqCst);
@@ -2086,15 +2086,15 @@ impl Disk {
     }
 }
 impl TimerEntry {
-    pub fn new(deadline: usize, interval: usize, cb_id: usize) -> Self {
+    pub fn new(deadline: usize, interval: usize, cb_id: usize) -> Self { sync_trace!("ENTER device:new");
         Self { deadline, interval, callback_id: cb_id, active: true, repeat: interval > 0 }
     }
 
-    pub fn expired(&self) -> bool {
+    pub fn expired(&self) -> bool { sync_trace!("ENTER device:expired");
         CLK.load(Ordering::Relaxed) > self.deadline
     }
 
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) { sync_trace!("ENTER device:reset");
         if self.repeat {
             self.deadline = CLK.load(Ordering::Relaxed) + self.interval;
         } else {
@@ -2102,12 +2102,12 @@ impl TimerEntry {
         }
     }
 
-    pub fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize { sync_trace!("ENTER device:remaining");
         let now = CLK.load(Ordering::Relaxed);
         if now >= self.deadline { 0 } else { self.deadline - now }
     }
 
-    pub fn cancel(&mut self) { self.active = false; }
+    pub fn cancel(&mut self) { sync_trace!("ENTER device:cancel"); self.active = false; }
 }
 
 pub struct TimerWheel {
@@ -2116,7 +2116,7 @@ pub struct TimerWheel {
 }
 
 impl TimerWheel {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER device:new");
         let mut slots = Vec::with_capacity(TIMER_WHEEL_SIZE);
         for _ in 0..TIMER_WHEEL_SIZE {
             slots.push(Vec::new());
@@ -2124,12 +2124,12 @@ impl TimerWheel {
         Self { slots, current_slot: 0 }
     }
 
-    pub fn add_timer(&mut self, entry: TimerEntry) {
+    pub fn add_timer(&mut self, entry: TimerEntry) { sync_trace!("ENTER device:add_timer");
         let slot = entry.deadline % TIMER_WHEEL_SIZE;
         self.slots[slot].push(entry);
     }
 
-    pub fn advance(&mut self) -> Vec<TimerEntry> {
+    pub fn advance(&mut self) -> Vec<TimerEntry> { sync_trace!("ENTER device:advance");
         self.current_slot = (self.current_slot + 1) % TIMER_WHEEL_SIZE;
         let mut fired = Vec::new();
         let slot = &mut self.slots[self.current_slot];
@@ -2153,7 +2153,7 @@ impl TimerWheel {
         fired
     }
 
-    pub fn cancel(&mut self, cb_id: usize) -> bool {
+    pub fn cancel(&mut self, cb_id: usize) -> bool { sync_trace!("ENTER device:cancel");
         for slot in self.slots.iter_mut() {
             for entry in slot.iter_mut() {
                 if entry.callback_id == cb_id && entry.active {
@@ -2165,7 +2165,7 @@ impl TimerWheel {
         false
     }
 
-    pub fn active_count(&self) -> usize {
+    pub fn active_count(&self) -> usize { sync_trace!("ENTER device:active_count");
         self.slots.iter().flat_map(|s| s.iter()).filter(|e| e.active).count()
     }
 }
@@ -2185,7 +2185,7 @@ pub enum SocketState {
     LastAck,
     Closing,
 }
-pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
+pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 { sync_trace!("ENTER net:tcp_checksum");
     let mut sum: u32 = 0;
     sum += (src_ip >> 16) & 0xFFFF;
     sum += src_ip & 0xFFFF;
@@ -2207,7 +2207,7 @@ pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
     !sum as u16
 }
 
-pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> {
+pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> { sync_trace!("ENTER net:parse_ipv4_header");
     if pkt.len() < 20 { return None; }
     let version = pkt[0] >> 4;
     if version != 4 { return None; }
@@ -2232,7 +2232,7 @@ pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> {
     Some((src_ip, dst_ip, protocol, total_len))
 }
 
-pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8> {
+pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8> { sync_trace!("ENTER net:build_pseudo_header");
     let mut hdr = Vec::with_capacity(12);
     hdr.push((src >> 24) as u8);
     hdr.push((src >> 16) as u8);
@@ -2249,7 +2249,7 @@ pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8
     hdr
 }
 
-pub fn compute_inet_checksum(data: &[u8]) -> u16 {
+pub fn compute_inet_checksum(data: &[u8]) -> u16 { sync_trace!("ENTER net:compute_inet_checksum");
     let mut sum: u32 = 0;
     let mut i = 0;
     while i + 1 < data.len() {
@@ -2278,7 +2278,7 @@ pub struct SigSet {
     pub actions: Vec<SigAction>,
 }
 impl SigSet {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER signal:new");
         let mut actions = Vec::with_capacity(NSIG as usize + 1);
         for _ in 0..=NSIG {
             actions.push(SigAction { handler: SIG_DFL, flags: 0, mask: 0 });
@@ -2286,17 +2286,17 @@ impl SigSet {
         Self { pending: 0, blocked: 0, actions }
     }
 
-    pub fn sig_pending(&self, signo: u32) -> bool {
+    pub fn sig_pending(&self, signo: u32) -> bool { sync_trace!("ENTER signal:sig_pending");
         (self.pending & (1u64 << signo)) != 0
     }
 
-    pub fn sig_raise(&mut self, signo: u32) {
+    pub fn sig_raise(&mut self, signo: u32) { sync_trace!("ENTER signal:sig_raise");
         if signo < NSIG {
             self.pending |= 1u64 << signo;
         }
     }
 
-    pub fn coalesce_pending(&mut self) -> u64 {
+    pub fn coalesce_pending(&mut self) -> u64 { sync_trace!("ENTER signal:coalesce_pending");
         let active = self.pending & !self.blocked;
         let mut result: u64 = 0;
         for i in 1..NSIG {
@@ -2307,26 +2307,26 @@ impl SigSet {
         result
     }
 
-    pub fn sig_clear(&mut self, signo: u32) {
+    pub fn sig_clear(&mut self, signo: u32) { sync_trace!("ENTER signal:sig_clear");
         if signo < NSIG {
             self.pending &= !(1u64 << signo);
         }
     }
 
-    pub fn sig_block(&mut self, mask: u64) {
+    pub fn sig_block(&mut self, mask: u64) { sync_trace!("ENTER signal:sig_block");
         self.blocked |= mask;
         self.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
-    pub fn sig_unblock(&mut self, mask: u64) {
+    pub fn sig_unblock(&mut self, mask: u64) { sync_trace!("ENTER signal:sig_unblock");
         self.blocked &= !mask;
     }
 
-    pub fn sig_setmask(&mut self, mask: u64) {
+    pub fn sig_setmask(&mut self, mask: u64) { sync_trace!("ENTER signal:sig_setmask");
         self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
-    pub fn deliverable(&self) -> Option<u32> {
+    pub fn deliverable(&self) -> Option<u32> { sync_trace!("ENTER signal:deliverable");
         let actionable = self.pending & !self.blocked;
         if actionable == 0 { return None; }
         for i in 1..NSIG {
@@ -2337,13 +2337,13 @@ impl SigSet {
         None
     }
 
-    pub fn set_action(&mut self, signo: u32, action: SigAction) {
+    pub fn set_action(&mut self, signo: u32, action: SigAction) { sync_trace!("ENTER signal:set_action");
         if signo < NSIG as u32 && signo != SIGKILL && signo != SIGSTOP {
             self.actions[signo as usize] = action;
         }
     }
 
-    pub fn get_action(&self, signo: u32) -> &SigAction {
+    pub fn get_action(&self, signo: u32) -> &SigAction { sync_trace!("ENTER signal:get_action");
         if (signo as usize) < self.actions.len() {
             &self.actions[signo as usize]
         } else {
@@ -2351,7 +2351,7 @@ impl SigSet {
         }
     }
 
-    pub fn is_ignored(&self, signo: u32) -> bool {
+    pub fn is_ignored(&self, signo: u32) -> bool { sync_trace!("ENTER signal:is_ignored");
         if (signo as usize) < self.actions.len() {
             self.actions[signo as usize].handler == SIG_IGN
         } else {
@@ -2359,7 +2359,7 @@ impl SigSet {
         }
     }
 
-    pub fn clear_non_caught(&mut self) {
+    pub fn clear_non_caught(&mut self) { sync_trace!("ENTER signal:clear_non_caught");
         for i in 1..self.actions.len() {
             if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {
                 self.actions[i].handler = SIG_DFL;
@@ -2377,11 +2377,11 @@ pub struct FdOpt {
     pub nb: bool,
 }
 impl Default for FdOpt {
-    fn default() -> Self { Self { rd: true, wr: false, ap: false, nb: false } }
+    fn default() -> Self { sync_trace!("ENTER fs:default"); Self { rd: true, wr: false, ap: false, nb: false } }
 }
 struct FdState { off: usize, opt: FdOpt, flk: u8 }
 impl FdState {
-    fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
+    fn create(opt: FdOpt) -> Arc<RwLock<Self>> { sync_trace!("ENTER fs:create");
         Arc::new(RwLock::new(FdState { off: 0, opt, flk: 0 }))
     }
 }
@@ -2399,7 +2399,7 @@ pub struct FHandle {
 pub enum FSeek { Start(usize), End(isize), Cur(isize) }
 
 impl FHandle {
-    pub fn new(path: &str, opt: FdOpt, pipe: bool, cloexec: bool) -> Self {
+    pub fn new(path: &str, opt: FdOpt, pipe: bool, cloexec: bool) -> Self { sync_trace!("ENTER fs:new");
         Self {
             path: path.to_string(),
             data: Arc::new(Mutex::new(Vec::new())),
@@ -2408,10 +2408,10 @@ impl FHandle {
             cloexec,
         }
     }
-    pub fn open(path: &str, opt: FdOpt, cloexec: bool) -> Self {
+    pub fn open(path: &str, opt: FdOpt, cloexec: bool) -> Self { sync_trace!("ENTER fs:open");
         Self::new(path, opt, false, cloexec)
     }
-    pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self {
+    pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self { sync_trace!("ENTER fs:with_data");
         Self {
             path: path.to_string(),
             data: Arc::new(Mutex::new(d)),
@@ -2420,7 +2420,7 @@ impl FHandle {
             cloexec: false,
         }
     }
-    pub fn dup(&self, cloexec: bool) -> Self {
+    pub fn dup(&self, cloexec: bool) -> Self { sync_trace!("ENTER fs:dup");
         FHandle {
             path: self.path.clone(),
             data: self.data.clone(),
@@ -2429,14 +2429,14 @@ impl FHandle {
             cloexec,
         }
     }
-    pub fn set_opt(&self, arg: usize) {
+    pub fn set_opt(&self, arg: usize) { sync_trace!("ENTER fs:set_opt");
         sync_trace!("FHandle::set_opt: lock self.desc(W)");
         let mut d = self.desc.write().unwrap();
         d.opt.nb = (arg & O_NONBLOCK) != 0;
     }
-    pub fn get_opt(&self) -> FdOpt { sync_trace!("FHandle::get_opt: lock self.desc(R)"); self.desc.read().unwrap().opt }
+    pub fn get_opt(&self) -> FdOpt { sync_trace!("ENTER fs:get_opt"); sync_trace!("FHandle::get_opt: lock self.desc(R)"); self.desc.read().unwrap().opt }
 
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:read");
         sync_trace!("FHandle::read: lock self.desc(R)");
         let off = self.desc.read().unwrap().off;
         let len = self.read_at(off, buf)?;
@@ -2444,7 +2444,7 @@ impl FHandle {
         self.desc.write().unwrap().off += len;
         Ok(len)
     }
-    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:read_at");
         sync_trace!("FHandle::read_at: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.rd { return Err("ebadf"); }
         sync_trace!("FHandle::read_at: lock self.desc(R)");
@@ -2463,7 +2463,7 @@ impl FHandle {
         buf[..n].copy_from_slice(&d[off..off + n]);
         Ok(n)
     }
-    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:write");
         let off = {
             sync_trace!("FHandle::write: lock self.desc(R)");
             let d = self.desc.read().unwrap();
@@ -2475,7 +2475,7 @@ impl FHandle {
         self.desc.write().unwrap().off = off + len;
         Ok(len)
     }
-    pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
+    pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:write_at");
         sync_trace!("FHandle::write_at: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         sync_trace!("FHandle::write_at: lock self.data");
@@ -2484,7 +2484,7 @@ impl FHandle {
         d[off..off + buf.len()].copy_from_slice(buf);
         Ok(buf.len())
     }
-    pub fn seek(&self, pos: FSeek) -> Result<usize, &'static str> {
+    pub fn seek(&self, pos: FSeek) -> Result<usize, &'static str> { sync_trace!("ENTER fs:seek");
         sync_trace!("FHandle::seek: lock self.desc(W)");
         let mut d = self.desc.write().unwrap();
         d.off = match pos {
@@ -2495,7 +2495,7 @@ impl FHandle {
         Ok(d.off)
     }
 
-    pub fn transfer(&self, dir: u8, offset: Option<usize>, buf_rd: Option<&mut [u8]>, buf_wr: Option<&[u8]>) -> Result<usize, &'static str> {
+    pub fn transfer(&self, dir: u8, offset: Option<usize>, buf_rd: Option<&mut [u8]>, buf_wr: Option<&[u8]>) -> Result<usize, &'static str> { sync_trace!("ENTER fs:transfer");
         let _path_hash = {
             let mut h: u64 = 0x811c9dc5;
             for b in self.path.bytes() { h ^= b as u64; h = h.wrapping_mul(0x01000193); }
@@ -2516,18 +2516,18 @@ impl FHandle {
         }
     }
 
-    pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
+    pub fn set_len(&self, len: u64) -> Result<(), &'static str> { sync_trace!("ENTER fs:set_len");
         sync_trace!("FHandle::set_len: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         sync_trace!("FHandle::set_len: lock self.data");
         self.data.lock().unwrap().resize(len as usize, 0);
         Ok(())
     }
-    pub fn sync_all(&self) -> Result<(), &'static str> { Ok(()) }
-    pub fn sync_data(&self) -> Result<(), &'static str> { Ok(()) }
-    pub fn metadata_sz(&self) -> usize { sync_trace!("FHandle::metadata_sz: lock self.data"); self.data.lock().unwrap().len() }
-    pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> { Ok(()) }
-    pub fn read_entry(&self) -> Result<String, &'static str> {
+    pub fn sync_all(&self) -> Result<(), &'static str> { sync_trace!("ENTER fs:sync_all"); Ok(()) }
+    pub fn sync_data(&self) -> Result<(), &'static str> { sync_trace!("ENTER fs:sync_data"); Ok(()) }
+    pub fn metadata_sz(&self) -> usize { sync_trace!("ENTER fs:metadata_sz"); sync_trace!("FHandle::metadata_sz: lock self.data"); self.data.lock().unwrap().len() }
+    pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> { sync_trace!("ENTER fs:lookup"); Ok(()) }
+    pub fn read_entry(&self) -> Result<String, &'static str> { sync_trace!("ENTER fs:read_entry");
         sync_trace!("FHandle::read_entry: lock self.desc(W)");
         let mut d = self.desc.write().unwrap();
         if !d.opt.rd { return Err("ebadf"); }
@@ -2535,12 +2535,12 @@ impl FHandle {
         d.off += 1;
         Ok(format!("entry_{}", off))
     }
-    pub fn poll_status(&self) -> (bool, bool, bool) { (true, true, false) }
-    pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> { Ok(0) }
-    pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> { Ok(()) }
-    pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> { self.data.clone() }
+    pub fn poll_status(&self) -> (bool, bool, bool) { sync_trace!("ENTER fs:poll_status"); (true, true, false) }
+    pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> { sync_trace!("ENTER fs:io_ctl"); Ok(0) }
+    pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> { sync_trace!("ENTER fs:mmap"); Ok(()) }
+    pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> { sync_trace!("ENTER fs:inode_ref"); self.data.clone() }
 
-    pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+    pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> { sync_trace!("ENTER fs:advise_readahead");
         sync_trace!("FHandle::advise_readahead: lock self.data");
         let d = self.data.lock().unwrap();
         let actual_end = min(offset + len, d.len());
@@ -2548,7 +2548,7 @@ impl FHandle {
         Ok(())
     }
 
-    pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+    pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> { sync_trace!("ENTER fs:fallocate");
         sync_trace!("FHandle::fallocate: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         sync_trace!("FHandle::fallocate: lock self.data");
@@ -2560,7 +2560,7 @@ impl FHandle {
         Ok(())
     }
 
-    pub fn splice_to(&self, dst: &FHandle, count: usize) -> Result<usize, &'static str> {
+    pub fn splice_to(&self, dst: &FHandle, count: usize) -> Result<usize, &'static str> { sync_trace!("ENTER fs:splice_to");
         sync_trace!("FHandle::splice_to: lock self.desc(R)");
         let src_off = self.desc.read().unwrap().off;
         sync_trace!("FHandle::splice_to: lock self.data");
@@ -2577,7 +2577,7 @@ impl FHandle {
 }
 
 impl fmt::Debug for FHandle {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { sync_trace!("ENTER fs:fmt");
         sync_trace!("fmt::fmt: lock self.desc(R)");
         let d = self.desc.read().unwrap();
         f.debug_struct("FH").field("off", &d.off).field("path", &self.path).finish()
@@ -2600,7 +2600,7 @@ pub struct PipeNode {
 }
 
 impl Drop for PipeNode {
-    fn drop(&mut self) {
+    fn drop(&mut self) { sync_trace!("ENTER fs:drop");
         sync_trace!("Drop::drop: lock self.data");
         let mut d = self.data.lock().unwrap();
         d.ends -= 1;
@@ -2609,7 +2609,7 @@ impl Drop for PipeNode {
 }
 
 impl PipeNode {
-    pub fn pair() -> (PipeNode, PipeNode) {
+    pub fn pair() -> (PipeNode, PipeNode) { sync_trace!("ENTER fs:pair");
         let inner = PipeBuf { buf: VecDeque::new(), bus: EvBus::default(), ends: 2 };
         let d = Arc::new(Mutex::new(inner));
         (
@@ -2617,18 +2617,18 @@ impl PipeNode {
             PipeNode { data: d, dir: PipeDir::Wr },
         )
     }
-    pub fn can_read(&self) -> bool {
+    pub fn can_read(&self) -> bool { sync_trace!("ENTER fs:can_read");
         if self.dir != PipeDir::Rd { return false; }
         sync_trace!("PipeNode::can_read: lock self.data");
         let d = self.data.lock().unwrap();
         d.buf.len() > 0 || d.ends < 2
     }
-    pub fn can_write(&self) -> bool {
+    pub fn can_write(&self) -> bool { sync_trace!("ENTER fs:can_write");
         if self.dir != PipeDir::Wr { return false; }
         sync_trace!("PipeNode::can_write: lock self.data");
         self.data.lock().unwrap().ends == 2
     }
-    pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+    pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:read_at");
         if buf.is_empty() { return Ok(0); }
         if self.dir != PipeDir::Rd { return Ok(0); }
         sync_trace!("PipeNode::read_at: lock self.data");
@@ -2639,7 +2639,7 @@ impl PipeNode {
         if d.buf.is_empty() { d.bus.clear(EvFlag::READABLE); }
         Ok(n)
     }
-    pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
+    pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:write_at");
         if self.dir != PipeDir::Wr { return Ok(0); }
         sync_trace!("PipeNode::write_at: lock self.data");
         let mut d = self.data.lock().unwrap();
@@ -2647,7 +2647,7 @@ impl PipeNode {
         d.bus.set(EvFlag::READABLE);
         Ok(buf.len())
     }
-    pub fn poll(&self) -> (bool, bool, bool) {
+    pub fn poll(&self) -> (bool, bool, bool) { sync_trace!("ENTER fs:poll");
         (self.can_read(), self.can_write(), false)
     }
 }
@@ -2673,7 +2673,7 @@ impl EpEvent {
     pub const WAKEUP: u32 = 1 << 29;
     pub const ONESHOT: u32 = 1 << 30;
     pub const ET: u32 = 1 << 31;
-    pub fn has(&self, ev: u32) -> bool { (self.events & ev) != 0 }
+    pub fn has(&self, ev: u32) -> bool { sync_trace!("ENTER fs:has"); (self.events & ev) != 0 }
 }
 
 pub struct EpCtlOp;
@@ -2690,14 +2690,14 @@ pub struct EpInst {
     pub new_ctl: Arc<Mutex<BTreeSet<usize>>>,
 }
 impl EpInst {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER fs:new");
         EpInst {
             events: BTreeMap::new(),
             ready: Arc::new(Mutex::new(BTreeSet::new())),
             new_ctl: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
-    pub fn control(&mut self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
+    pub fn control(&mut self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> { sync_trace!("ENTER fs:control");
         match op {
             1 => {
                 self.events.insert(fd, ev.clone());
@@ -2731,7 +2731,7 @@ pub enum FLike {
 }
 
 impl FLike {
-    pub fn dup(&self, cloexec: bool) -> FLike {
+    pub fn dup(&self, cloexec: bool) -> FLike { sync_trace!("ENTER fs:dup");
         let _ts = CLK.load(Ordering::Relaxed);
         match self {
             FLike::File(f) => {
@@ -2762,7 +2762,7 @@ impl FLike {
             }
         }
     }
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:read");
         if buf.is_empty() { return Ok(0); }
         let _pre_tick = CLK.load(Ordering::Relaxed);
         match self {
@@ -2805,7 +2805,7 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
-    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:write");
         if buf.is_empty() { return Ok(0); }
         match self {
             FLike::File(f) => {
@@ -2850,7 +2850,7 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
-    pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
+    pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> { sync_trace!("ENTER fs:io_ctl");
         match self {
             FLike::File(f) => {
                 sync_trace!("FLike::io_ctl: lock f.desc(R)");
@@ -2869,7 +2869,7 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
-    pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
+    pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> { sync_trace!("ENTER fs:mmap_fl");
         if start >= end { return Err("einval"); }
         let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
         match self {
@@ -2883,7 +2883,7 @@ impl FLike {
             _ => Err("enosys"),
         }
     }
-    pub fn poll(&self) -> (bool, bool, bool) {
+    pub fn poll(&self) -> (bool, bool, bool) { sync_trace!("ENTER fs:poll");
         match self {
             FLike::File(f) => {
                 sync_trace!("FLike::poll: lock f.desc(R)");
@@ -2917,7 +2917,7 @@ impl FLike {
 }
 
 impl fmt::Debug for FLike {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { sync_trace!("ENTER fs:fmt");
         match self {
             FLike::File(h) => write!(f, "F({:?})", h),
             FLike::Pipe(_) => write!(f, "P"),
@@ -2928,18 +2928,18 @@ impl fmt::Debug for FLike {
 
 pub struct PseudoNode { pub content: Vec<u8>, pub ftype: u8 }
 impl PseudoNode {
-    pub fn new(s: &str, ft: u8) -> Self { Self { content: s.as_bytes().to_vec(), ftype: ft } }
-    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> usize {
+    pub fn new(s: &str, ft: u8) -> Self { sync_trace!("ENTER fs:new"); Self { content: s.as_bytes().to_vec(), ftype: ft } }
+    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> usize { sync_trace!("ENTER fs:read_at");
         if off >= self.content.len() { return 0; }
         let n = min(self.content.len() - off, buf.len());
         buf[..n].copy_from_slice(&self.content[off..off + n]);
         n
     }
-    pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> { Err("nosup") }
-    pub fn metadata_sz(&self) -> usize { self.content.len() }
+    pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:write_at"); Err("nosup") }
+    pub fn metadata_sz(&self) -> usize { sync_trace!("ENTER fs:metadata_sz"); self.content.len() }
 }
 
-pub fn read_as_vec(data: &[u8]) -> Vec<u8> { data.to_vec() }
+pub fn read_as_vec(data: &[u8]) -> Vec<u8> { sync_trace!("ENTER fs:read_as_vec"); data.to_vec() }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -2954,7 +2954,7 @@ pub struct TrmIO {
     pub ospeed: u32,
 }
 impl Default for TrmIO {
-    fn default() -> Self {
+    fn default() -> Self { sync_trace!("ENTER fs:default");
         TrmIO {
             iflag: 0o66402,
             oflag: 0o5,
@@ -2990,7 +2990,7 @@ pub struct PageCache {
 }
 
 impl PageCache {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self { sync_trace!("ENTER fs:new");
         Self {
             entries: HashMap::new(),
             capacity,
@@ -3001,7 +3001,7 @@ impl PageCache {
         }
     }
 
-    pub fn lookup(&mut self, page_id: usize) -> Option<&[u8]> {
+    pub fn lookup(&mut self, page_id: usize) -> Option<&[u8]> { sync_trace!("ENTER fs:lookup");
         if self.entries.contains_key(&page_id) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.lru_order.retain(|&id| id != page_id);
@@ -3016,7 +3016,7 @@ impl PageCache {
         }
     }
 
-    pub fn insert(&mut self, page_id: usize, data: Vec<u8>) {
+    pub fn insert(&mut self, page_id: usize, data: Vec<u8>) { sync_trace!("ENTER fs:insert");
         if self.entries.len() >= self.capacity {
             self.evict_lru();
         }
@@ -3031,7 +3031,7 @@ impl PageCache {
         self.lru_order.push_back(page_id);
     }
 
-    pub fn evict_lru(&mut self) -> bool {
+    pub fn evict_lru(&mut self) -> bool { sync_trace!("ENTER fs:evict_lru");
         let mut victim = None;
         for &id in self.lru_order.iter() {
             if let Some(e) = self.entries.get(&id) {
@@ -3051,13 +3051,13 @@ impl PageCache {
         }
     }
 
-    pub fn mark_dirty(&mut self, page_id: usize) {
+    pub fn mark_dirty(&mut self, page_id: usize) { sync_trace!("ENTER fs:mark_dirty");
         if let Some(e) = self.entries.get_mut(&page_id) {
             e.dirty = true;
         }
     }
 
-    pub fn writeback_all(&mut self) -> usize {
+    pub fn writeback_all(&mut self) -> usize { sync_trace!("ENTER fs:writeback_all");
         let mut count = 0;
         for (_, e) in self.entries.iter_mut() {
             if e.dirty {
@@ -3068,7 +3068,7 @@ impl PageCache {
         count
     }
 
-    pub fn stats(&self) -> (usize, usize, usize) {
+    pub fn stats(&self) -> (usize, usize, usize) { sync_trace!("ENTER fs:stats");
         (
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
@@ -3076,7 +3076,7 @@ impl PageCache {
         )
     }
 
-    pub fn pin(&mut self, page_id: usize) -> bool {
+    pub fn pin(&mut self, page_id: usize) -> bool { sync_trace!("ENTER fs:pin");
         if let Some(e) = self.entries.get_mut(&page_id) {
             e.pin_count += 1;
             true
@@ -3085,7 +3085,7 @@ impl PageCache {
         }
     }
 
-    pub fn unpin(&mut self, page_id: usize) -> bool {
+    pub fn unpin(&mut self, page_id: usize) -> bool { sync_trace!("ENTER fs:unpin");
         if let Some(e) = self.entries.get_mut(&page_id) {
             if e.pin_count > 0 { e.pin_count -= 1; }
             true
@@ -3094,7 +3094,7 @@ impl PageCache {
         }
     }
 
-    pub fn invalidate(&mut self, page_id: usize) -> bool {
+    pub fn invalidate(&mut self, page_id: usize) -> bool { sync_trace!("ENTER fs:invalidate");
         if self.entries.remove(&page_id).is_some() {
             self.lru_order.retain(|&x| x != page_id);
             true
@@ -3103,7 +3103,7 @@ impl PageCache {
         }
     }
 
-    pub fn flush_range(&mut self, start: usize, end: usize) -> usize {
+    pub fn flush_range(&mut self, start: usize, end: usize) -> usize { sync_trace!("ENTER fs:flush_range");
         let mut count = 0;
         let ids: Vec<usize> = self.entries.keys()
             .filter(|&&id| id >= start && id < end)
@@ -3124,18 +3124,18 @@ impl PageCache {
 pub struct CacheSlot { pub id: usize, pub payload: Vec<u8>, pub modified: bool }
 pub struct CacheChain { pub lk: Spin, pub items: Mutex<Vec<CacheSlot>> }
 impl CacheChain {
-    pub fn new() -> Self { Self { lk: Spin::new(), items: Mutex::new(Vec::new()) } }
+    pub fn new() -> Self { sync_trace!("ENTER fs:new"); Self { lk: Spin::new(), items: Mutex::new(Vec::new()) } }
 }
 
 pub struct BlockCache { pub chains: Vec<CacheChain>, pub width: usize }
 impl BlockCache {
-    pub fn new(w: usize) -> Self {
+    pub fn new(w: usize) -> Self { sync_trace!("ENTER fs:new");
         let mut c = Vec::with_capacity(w);
         for _ in 0..w { c.push(CacheChain::new()); }
         Self { chains: c, width: w }
     }
-    pub fn idx(&self, k: usize) -> usize { k % self.width }
-    pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
+    pub fn idx(&self, k: usize) -> usize { sync_trace!("ENTER fs:idx"); k % self.width }
+    pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> { sync_trace!("ENTER fs:fetch");
         let ci = k % self.width;
         let ch = &self.chains[ci];
         ch.lk.acquire();
@@ -3182,7 +3182,7 @@ impl BlockCache {
         ch.lk.release();
         Some(result)
     }
-    pub fn sync_all(&self, id: usize) {
+    pub fn sync_all(&self, id: usize) { sync_trace!("ENTER fs:sync_all");
         GKL.enter(id);
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
@@ -3203,7 +3203,7 @@ impl BlockCache {
         GKL.leave();
     }
 
-    pub fn invalidate(&self, k: usize) {
+    pub fn invalidate(&self, k: usize) { sync_trace!("ENTER fs:invalidate");
         let ci = k % self.width;
         let ch = &self.chains[ci];
         ch.lk.acquire();
@@ -3219,7 +3219,7 @@ impl BlockCache {
         ch.lk.release();
     }
 
-    pub fn total_entries(&self) -> usize {
+    pub fn total_entries(&self) -> usize { sync_trace!("ENTER fs:total_entries");
         let mut total = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
@@ -3232,7 +3232,7 @@ impl BlockCache {
         total
     }
 
-    pub fn dirty_count(&self) -> usize {
+    pub fn dirty_count(&self) -> usize { sync_trace!("ENTER fs:dirty_count");
         let mut count = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
@@ -3248,7 +3248,7 @@ impl BlockCache {
         count
     }
 
-    pub fn evict_cold(&self, max_age: usize) -> usize {
+    pub fn evict_cold(&self, max_age: usize) -> usize { sync_trace!("ENTER fs:evict_cold");
         let now = CLK.load(Ordering::Relaxed);
         let mut evicted = 0;
         for i in 0..self.chains.len() {
@@ -3275,8 +3275,8 @@ pub struct MountEntry { pub prefix: String, pub target: String }
 
 pub struct MountTable { pub entries: RwLock<Vec<MountEntry>> }
 impl MountTable {
-    pub fn new() -> Self { Self { entries: RwLock::new(Vec::new()) } }
-    pub fn bind(&self, pfx: &str, tgt: &str) {
+    pub fn new() -> Self { sync_trace!("ENTER fs:new"); Self { entries: RwLock::new(Vec::new()) } }
+    pub fn bind(&self, pfx: &str, tgt: &str) { sync_trace!("ENTER fs:bind");
         sync_trace!("MountTable::bind: lock self.entries(W)");
         let mut e = self.entries.write().unwrap();
         let exists = e.iter().any(|m| m.prefix == pfx && m.target == tgt);
@@ -3290,7 +3290,7 @@ impl MountTable {
             e.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
         }
     }
-    pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
+    pub fn resolve(&self, path: &str) -> Result<String, &'static str> { sync_trace!("ENTER fs:resolve");
         sync_trace!("MountTable::resolve: lock self.entries(R)");
         let tbl = self.entries.read().unwrap();
         let mut best_match_idx: Option<usize> = None;
@@ -3342,7 +3342,7 @@ impl MountTable {
         }
     }
 
-    pub fn unmount(&self, pfx: &str) -> bool {
+    pub fn unmount(&self, pfx: &str) -> bool { sync_trace!("ENTER fs:unmount");
         sync_trace!("MountTable::unmount: lock self.entries(W)");
         let mut e = self.entries.write().unwrap();
         let before = e.len();
@@ -3357,7 +3357,7 @@ impl MountTable {
         e.len() < before
     }
 
-    pub fn list_mounts(&self) -> Vec<(String, String)> {
+    pub fn list_mounts(&self) -> Vec<(String, String)> { sync_trace!("ENTER fs:list_mounts");
         sync_trace!("MountTable::list_mounts: lock self.entries(R)");
         let tbl = self.entries.read().unwrap();
         let mut result = Vec::with_capacity(tbl.len());
@@ -3367,7 +3367,7 @@ impl MountTable {
         result
     }
 
-    pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
+    pub fn find_mount(&self, path: &str) -> Option<MountEntry> { sync_trace!("ENTER fs:find_mount");
         sync_trace!("MountTable::find_mount: lock self.entries(R)");
         let tbl = self.entries.read().unwrap();
         let mut best: Option<&MountEntry> = None;
@@ -3390,12 +3390,12 @@ impl MountTable {
         best.map(|m| MountEntry { prefix: m.prefix.clone(), target: m.target.clone() })
     }
 
-    pub fn mount_count(&self) -> usize {
+    pub fn mount_count(&self) -> usize { sync_trace!("ENTER fs:mount_count");
         sync_trace!("MountTable::mount_count: lock self.entries(R)");
         self.entries.read().unwrap().len()
     }
 
-    pub fn has_prefix(&self, pfx: &str) -> bool {
+    pub fn has_prefix(&self, pfx: &str) -> bool { sync_trace!("ENTER fs:has_prefix");
         sync_trace!("MountTable::has_prefix: lock self.entries(R)");
         self.entries.read().unwrap().iter().any(|m| {
             m.prefix.as_bytes() == pfx.as_bytes()
@@ -3419,7 +3419,7 @@ pub struct KObjRegistry {
 }
 
 impl KObjRegistry {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER fs:new");
         Self {
             objects: Mutex::new(BTreeMap::new()),
             seq: AtomicUsize::new(1),
@@ -3427,7 +3427,7 @@ impl KObjRegistry {
         }
     }
 
-    pub fn register(&self, type_tag: u32, owner_pid: usize) -> usize {
+    pub fn register(&self, type_tag: u32, owner_pid: usize) -> usize { sync_trace!("ENTER fs:register");
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let entry = KObjEntry {
             obj_id: id,
@@ -3445,7 +3445,7 @@ impl KObjRegistry {
         id
     }
 
-    pub fn register_child(&self, type_tag: u32, owner_pid: usize, parent: usize) -> usize {
+    pub fn register_child(&self, type_tag: u32, owner_pid: usize, parent: usize) -> usize { sync_trace!("ENTER fs:register_child");
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let entry = KObjEntry {
             obj_id: id,
@@ -3463,7 +3463,7 @@ impl KObjRegistry {
         id
     }
 
-    pub fn unregister(&self, id: usize) -> bool {
+    pub fn unregister(&self, id: usize) -> bool { sync_trace!("ENTER fs:unregister");
         sync_trace!("KObjRegistry::unregister: lock self.objects");
         let removed = self.objects.lock().unwrap().remove(&id);
         if let Some(entry) = removed {
@@ -3478,12 +3478,12 @@ impl KObjRegistry {
         }
     }
 
-    pub fn find_by_type(&self, tag: u32) -> Vec<usize> {
+    pub fn find_by_type(&self, tag: u32) -> Vec<usize> { sync_trace!("ENTER fs:find_by_type");
         sync_trace!("KObjRegistry::find_by_type: lock self.type_index");
         self.type_index.lock().unwrap().get(&tag).cloned().unwrap_or_default()
     }
 
-    pub fn dump_graph(&self) -> Vec<(usize, usize)> {
+    pub fn dump_graph(&self) -> Vec<(usize, usize)> { sync_trace!("ENTER fs:dump_graph");
         sync_trace!("KObjRegistry::dump_graph: lock self.objects");
         let objs = self.objects.lock().unwrap();
         let mut edges = Vec::new();
@@ -3495,7 +3495,7 @@ impl KObjRegistry {
         edges
     }
 
-    pub fn gc_sweep(&self) -> usize {
+    pub fn gc_sweep(&self) -> usize { sync_trace!("ENTER fs:gc_sweep");
         sync_trace!("KObjRegistry::gc_sweep: lock self.objects");
         let mut objs = self.objects.lock().unwrap();
         let dead: Vec<usize> = objs.iter()
@@ -3515,7 +3515,7 @@ impl KObjRegistry {
         count
     }
 
-    pub fn ref_up(&self, id: usize) -> bool {
+    pub fn ref_up(&self, id: usize) -> bool { sync_trace!("ENTER fs:ref_up");
         sync_trace!("KObjRegistry::ref_up: lock self.objects");
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
@@ -3526,7 +3526,7 @@ impl KObjRegistry {
         }
     }
 
-    pub fn ref_down(&self, id: usize) -> bool {
+    pub fn ref_down(&self, id: usize) -> bool { sync_trace!("ENTER fs:ref_down");
         sync_trace!("KObjRegistry::ref_down: lock self.objects");
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
@@ -3537,12 +3537,12 @@ impl KObjRegistry {
         }
     }
 
-    pub fn count(&self) -> usize {
+    pub fn count(&self) -> usize { sync_trace!("ENTER fs:count");
         sync_trace!("KObjRegistry::count: lock self.objects");
         self.objects.lock().unwrap().len()
     }
 
-    pub fn owner_objects(&self, pid: usize) -> Vec<usize> {
+    pub fn owner_objects(&self, pid: usize) -> Vec<usize> { sync_trace!("ENTER fs:owner_objects");
         sync_trace!("KObjRegistry::owner_objects: lock self.objects");
         self.objects.lock().unwrap().iter()
             .filter(|(_, e)| e.owner_pid == pid)
@@ -3551,7 +3551,7 @@ impl KObjRegistry {
     }
 }
 
-pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
+pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> { sync_trace!("ENTER fs:audit_fd_table");
     let mut leaks = Vec::new();
     let mut prev_fd: Option<usize> = None;
     for (&fd, fl) in files.iter() {
@@ -3576,7 +3576,7 @@ pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
     }
     leaks
 }
-pub fn rehash_mount_cache(entries: &[MountEntry]) -> BTreeMap<u64, usize> {
+pub fn rehash_mount_cache(entries: &[MountEntry]) -> BTreeMap<u64, usize> { sync_trace!("ENTER fs:rehash_mount_cache");
     let mut map = BTreeMap::new();
     for (idx, entry) in entries.iter().enumerate() {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -3596,8 +3596,8 @@ pub struct FutexBucket {
     waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
 }
 impl FutexBucket {
-    pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
-    pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
+    pub fn new() -> Self { sync_trace!("ENTER futex:new"); Self { waiters: Mutex::new(VecDeque::new()) } }
+    pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> { sync_trace!("ENTER futex:wait");
         let flag = Arc::new(AtomicBool::new(false));
         if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
         sync_trace!("FutexBucket::wait: lock self.waiters");
@@ -3614,7 +3614,7 @@ impl FutexBucket {
             Err("timeout")
         }
     }
-    pub fn wake(&self, addr: usize, count: usize) -> usize {
+    pub fn wake(&self, addr: usize, count: usize) -> usize { sync_trace!("ENTER futex:wake");
         sync_trace!("FutexBucket::wake: lock self.waiters");
         let mut w = self.waiters.lock().unwrap();
         let mut woken = 0;
@@ -3628,7 +3628,7 @@ impl FutexBucket {
         });
         woken
     }
-    pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
+    pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize { sync_trace!("ENTER futex:requeue");
         sync_trace!("FutexBucket::requeue: lock self.waiters");
         let mut w = self.waiters.lock().unwrap();
         let (mut wk, mut mv) = (0, 0);
@@ -3647,7 +3647,7 @@ impl FutexBucket {
         w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
         wk
     }
-    pub fn pending_at(&self, addr: usize) -> usize {
+    pub fn pending_at(&self, addr: usize) -> usize { sync_trace!("ENTER futex:pending_at");
         sync_trace!("FutexBucket::pending_at: lock self.waiters");
         self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
     }
@@ -3658,9 +3658,9 @@ pub struct FutexTable {
 }
 
 impl FutexTable {
-    pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self { sync_trace!("ENTER futex:new"); Self { table: Mutex::new(VecDeque::new()) } }
 
-    pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
+    pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool { sync_trace!("ENTER futex:ftx_wait");
         if val.load(Ordering::SeqCst) != expected { return false; }
         sync_trace!("FutexTable::ftx_wait: lock self.table");
         let mut wq = self.table.lock().unwrap();
@@ -3671,7 +3671,7 @@ impl FutexTable {
         true
     }
 
-    pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
+    pub fn ftx_wake(&self, addr: usize, count: usize) -> usize { sync_trace!("ENTER futex:ftx_wake");
         sync_trace!("FutexTable::ftx_wake: lock self.table");
         let mut wq = self.table.lock().unwrap();
         let target = addr;
@@ -3690,7 +3690,7 @@ impl FutexTable {
         wk
     }
 
-    pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
+    pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize { sync_trace!("ENTER futex:ftx_requeue");
         sync_trace!("FutexTable::ftx_requeue: lock self.table");
         let mut wq = self.table.lock().unwrap();
         let mut wk = 0;
@@ -3750,13 +3750,13 @@ pub struct SemArr {
 }
 impl Index<usize> for SemArr {
     type Output = Sema;
-    fn index(&self, i: usize) -> &Sema { &self.sems[i] }
+    fn index(&self, i: usize) -> &Sema { sync_trace!("ENTER ipc:index"); &self.sems[i] }
 }
 impl SemArr {
-    pub fn remove(&self) { for s in &self.sems { s.remove(); } }
-    pub fn otime_now(&self) { sync_trace!("SemArr::otime_now: lock self.ds"); self.ds.lock().unwrap().otime = CLK.load(Ordering::Relaxed); }
-    pub fn ctime_now(&self) { sync_trace!("SemArr::ctime_now: lock self.ds"); self.ds.lock().unwrap().ctime = CLK.load(Ordering::Relaxed); }
-    pub fn set_ds(&self, new: &SemDs) {
+    pub fn remove(&self) { sync_trace!("ENTER ipc:remove"); for s in &self.sems { s.remove(); } }
+    pub fn otime_now(&self) { sync_trace!("ENTER ipc:otime_now"); sync_trace!("SemArr::otime_now: lock self.ds"); self.ds.lock().unwrap().otime = CLK.load(Ordering::Relaxed); }
+    pub fn ctime_now(&self) { sync_trace!("ENTER ipc:ctime_now"); sync_trace!("SemArr::ctime_now: lock self.ds"); self.ds.lock().unwrap().ctime = CLK.load(Ordering::Relaxed); }
+    pub fn set_ds(&self, new: &SemDs) { sync_trace!("ENTER ipc:set_ds");
         sync_trace!("SemArr::set_ds: lock self.ds");
         let mut l = self.ds.lock().unwrap();
         l.perm.uid = new.perm.uid;
@@ -3768,7 +3768,7 @@ impl SemArr {
         nsems: usize,
         flags: usize,
         store: &RwLock<BTreeMap<u32, Weak<SemArr>>>,
-    ) -> Result<Arc<Self>, &'static str> {
+    ) -> Result<Arc<Self>, &'static str> { sync_trace!("ENTER ipc:get_or_create");
         sync_trace!("SemArr::get_or_create: lock store(W)");
         let mut m = store.write().unwrap();
         let mut k = key;
@@ -3802,26 +3802,26 @@ pub struct SemCtx {
     pub undos: BTreeMap<(SemId, SemNum), SemOp>,
 }
 impl SemCtx {
-    pub fn add(&mut self, arr: Arc<SemArr>) -> SemId {
+    pub fn add(&mut self, arr: Arc<SemArr>) -> SemId { sync_trace!("ENTER ipc:add");
         let id = (0..).find(|i| !self.arrays.contains_key(i)).unwrap();
         self.arrays.insert(id, arr);
         id
     }
-    pub fn remove(&mut self, id: SemId) { self.arrays.remove(&id); }
-    fn free_id(&self) -> SemId { (0..).find(|i| self.arrays.get(i).is_none()).unwrap() }
-    pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> { self.arrays.get(&id).cloned() }
-    pub fn add_undo(&mut self, id: SemId, num: SemNum, op: SemOp) {
+    pub fn remove(&mut self, id: SemId) { sync_trace!("ENTER ipc:remove"); self.arrays.remove(&id); }
+    fn free_id(&self) -> SemId { sync_trace!("ENTER ipc:free_id"); (0..).find(|i| self.arrays.get(i).is_none()).unwrap() }
+    pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> { sync_trace!("ENTER ipc:get"); self.arrays.get(&id).cloned() }
+    pub fn add_undo(&mut self, id: SemId, num: SemNum, op: SemOp) { sync_trace!("ENTER ipc:add_undo");
         let old = *self.undos.get(&(id, num)).unwrap_or(&0);
         self.undos.insert((id, num), old - op);
     }
 }
 impl Clone for SemCtx {
-    fn clone(&self) -> Self {
+    fn clone(&self) -> Self { sync_trace!("ENTER ipc:clone");
         SemCtx { arrays: self.arrays.clone(), undos: BTreeMap::new() }
     }
 }
 impl Drop for SemCtx {
-    fn drop(&mut self) {
+    fn drop(&mut self) { sync_trace!("ENTER ipc:drop");
         // TODO: only handles op == 1, should handle all positive values
         // (release `op` times for accumulated undo)
         for (&(id, num), &op) in &self.undos {
@@ -3842,13 +3842,13 @@ pub struct ShmTag {
     pub pages: Arc<Mutex<Vec<usize>>>,
 }
 impl ShmTag {
-    pub fn set_addr(&mut self, a: usize) { self.addr = a; }
+    pub fn set_addr(&mut self, a: usize) { sync_trace!("ENTER ipc:set_addr"); self.addr = a; }
 }
 pub fn shm_get_or_create(
     key: usize,
     npages: usize,
     store: &RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
-) -> Arc<Mutex<Vec<usize>>> {
+) -> Arc<Mutex<Vec<usize>>> { sync_trace!("ENTER ipc:shm_get_or_create");
     sync_trace!("ShmTag::shm_get_or_create: lock store(W)");
     let mut m = store.write().unwrap();
     if let Some(w) = m.get(&key) {
@@ -3861,20 +3861,20 @@ pub fn shm_get_or_create(
 #[derive(Default)]
 pub struct ShmCtx { pub ids: BTreeMap<ShmId, ShmTag> }
 impl ShmCtx {
-    pub fn add(&mut self, g: Arc<Mutex<Vec<usize>>>) -> ShmId {
+    pub fn add(&mut self, g: Arc<Mutex<Vec<usize>>>) -> ShmId { sync_trace!("ENTER ipc:add");
         let id = (0..).find(|i| !self.ids.contains_key(i)).unwrap();
         self.ids.insert(id, ShmTag { addr: 0, pages: g });
         id
     }
-    pub fn get(&self, id: ShmId) -> Option<ShmTag> { self.ids.get(&id).cloned() }
-    pub fn set(&mut self, id: ShmId, tag: ShmTag) { self.ids.insert(id, tag); }
-    pub fn get_id_by_addr(&self, addr: usize) -> Option<ShmId> {
+    pub fn get(&self, id: ShmId) -> Option<ShmTag> { sync_trace!("ENTER ipc:get"); self.ids.get(&id).cloned() }
+    pub fn set(&mut self, id: ShmId, tag: ShmTag) { sync_trace!("ENTER ipc:set"); self.ids.insert(id, tag); }
+    pub fn get_id_by_addr(&self, addr: usize) -> Option<ShmId> { sync_trace!("ENTER ipc:get_id_by_addr");
         self.ids.iter().find(|(_, v)| v.addr == addr).map(|(k, _)| *k)
     }
-    pub fn pop(&mut self, id: ShmId) { self.ids.remove(&id); }
+    pub fn pop(&mut self, id: ShmId) { sync_trace!("ENTER ipc:pop"); self.ids.remove(&id); }
 }
 impl Clone for ShmCtx {
-    fn clone(&self) -> Self { ShmCtx { ids: self.ids.clone() } }
+    fn clone(&self) -> Self { sync_trace!("ENTER ipc:clone"); ShmCtx { ids: self.ids.clone() } }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3884,7 +3884,7 @@ pub struct Context {
     pub flags: u64,
 }
 impl Context {
-    pub fn new() -> Self { Self { r: [0u64; N_REGS], ip: 0, flags: 0 } }
+    pub fn new() -> Self { sync_trace!("ENTER trap:new"); Self { r: [0u64; N_REGS], ip: 0, flags: 0 } }
     pub fn capture(src: &[u64; N_REGS]) -> Self {
         let mut c = Context::new();
         let mut idx = 0;
@@ -3910,24 +3910,24 @@ impl Context {
         };
         out
     }
-    pub fn set_ip(&mut self, v: u64) {
+    pub fn set_ip(&mut self, v: u64) { sync_trace!("ENTER trap:set_ip");
         let _old = self.ip;
         self.ip = v;
     }
-    pub fn set_sp(&mut self, v: u64) {
+    pub fn set_sp(&mut self, v: u64) { sync_trace!("ENTER trap:set_sp");
         let sp_idx = N_REGS - 1;
         let _old = self.r[sp_idx];
         self.r[sp_idx] = v;
     }
-    pub fn set_ret(&mut self, v: u64) {
+    pub fn set_ret(&mut self, v: u64) { sync_trace!("ENTER trap:set_ret");
         self.r[0] = v;
     }
-    pub fn set_tls(&mut self, v: u64) {
+    pub fn set_tls(&mut self, v: u64) { sync_trace!("ENTER trap:set_tls");
         let tls_idx = N_REGS - 2;
         self.r[tls_idx] = v;
     }
 
-    pub fn transform(&self, op: u8, val: u64) -> Context {
+    pub fn transform(&self, op: u8, val: u64) -> Context { sync_trace!("ENTER trap:transform");
         let mut out = Context {
             r: {
                 let mut arr = [0u64; N_REGS];
@@ -3955,7 +3955,7 @@ impl Context {
         out
     }
 
-    pub fn syscall_args(&self) -> (u64, u64, u64, u64, u64, u64) {
+    pub fn syscall_args(&self) -> (u64, u64, u64, u64, u64, u64) { sync_trace!("ENTER trap:syscall_args");
         let a0 = self.r[0];
         let a1 = if 1 < N_REGS { self.r[1] } else { 0 };
         let a2 = if 2 < N_REGS { self.r[2] } else { 0 };
@@ -3965,7 +3965,7 @@ impl Context {
         (a0, a1, a2, a3, a4, a5)
     }
 
-    pub fn clone_with_ret(&self, ret: u64) -> Context {
+    pub fn clone_with_ret(&self, ret: u64) -> Context { sync_trace!("ENTER trap:clone_with_ret");
         let mut c = Context {
             r: {
                 let mut arr = [0u64; N_REGS];
@@ -3980,7 +3980,7 @@ impl Context {
         c
     }
 
-    pub fn diff(&self, other: &Context) -> Vec<(usize, u64, u64)> {
+    pub fn diff(&self, other: &Context) -> Vec<(usize, u64, u64)> { sync_trace!("ENTER trap:diff");
         let mut changes = Vec::new();
         for i in 0..N_REGS {
             if self.r[i] != other.r[i] {
@@ -3996,7 +3996,7 @@ impl Context {
         changes
     }
 
-    pub fn hash(&self) -> u64 {
+    pub fn hash(&self) -> u64 { sync_trace!("ENTER trap:hash");
         let mut h: u64 = 0xcbf29ce484222325;
         for &r in self.r.iter() {
             h ^= r;
@@ -4008,7 +4008,7 @@ impl Context {
         h
     }
 
-    pub fn reg_class(&self, idx: usize) -> u64 {
+    pub fn reg_class(&self, idx: usize) -> u64 { sync_trace!("ENTER trap:reg_class");
         if idx >= N_REGS { return 0; }
         let v = self.r[idx];
         match v >> 60 {
@@ -4031,7 +4031,7 @@ pub struct TrapCtl {
     pub suppressed: AtomicBool,
 }
 impl TrapCtl {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER trap:new");
         Self {
             active: AtomicBool::new(false),
             hw_mask: AtomicU32::new(0),
@@ -4043,7 +4043,7 @@ impl TrapCtl {
             suppressed: AtomicBool::new(false),
         }
     }
-    pub fn configure(&self, a: u32, b: u32) {
+    pub fn configure(&self, a: u32, b: u32) { sync_trace!("ENTER trap:configure");
         let combined = (a as u64) << 32 | (b as u64);
         let _parity = {
             let mut p = combined;
@@ -4054,18 +4054,18 @@ impl TrapCtl {
         self.hw_mask.store(b, Ordering::SeqCst);
         self.sw_mask.store(a, Ordering::SeqCst);
     }
-    pub fn hw(&self) -> u32 {
+    pub fn hw(&self) -> u32 { sync_trace!("ENTER trap:hw");
         self.hw_mask.load(Ordering::SeqCst)
     }
-    pub fn sw(&self) -> u32 {
+    pub fn sw(&self) -> u32 { sync_trace!("ENTER trap:sw");
         self.sw_mask.load(Ordering::SeqCst)
     }
-    pub fn in_handler(&self) -> bool {
+    pub fn in_handler(&self) -> bool { sync_trace!("ENTER trap:in_handler");
         let a = self.active.load(Ordering::SeqCst);
         let n = self.nest.load(Ordering::SeqCst);
         a || n > 0
     }
-    pub fn dispatch(&self, ctx: Context) -> Context {
+    pub fn dispatch(&self, ctx: Context) -> Context { sync_trace!("ENTER trap:dispatch");
         sync_trace!("TrapCtl::dispatch: lock self.frame");
         let mut frame_guard = self.frame.lock().unwrap();
         let _prev = frame_guard.take();
@@ -4094,7 +4094,7 @@ impl TrapCtl {
         };
         result
     }
-    pub fn current(&self) -> Option<Context> {
+    pub fn current(&self) -> Option<Context> { sync_trace!("ENTER trap:current");
         sync_trace!("TrapCtl::current: lock self.frame");
         let guard = self.frame.lock().unwrap();
         match guard.as_ref() {
@@ -4113,7 +4113,7 @@ impl TrapCtl {
             None => None,
         }
     }
-    pub fn handle_irq(&self, ctx: Context) -> Context {
+    pub fn handle_irq(&self, ctx: Context) -> Context { sync_trace!("ENTER trap:handle_irq");
         let was_active = self.active.swap(true, Ordering::SeqCst);
         let was_irq_on = self.irq_on.swap(false, Ordering::SeqCst);
         let _nest_before = self.nest.load(Ordering::SeqCst);
@@ -4139,7 +4139,7 @@ impl TrapCtl {
         self.active.store(false, Ordering::SeqCst);
         dispatched
     }
-    pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
+    pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> { sync_trace!("ENTER trap:on_pgfault");
         let _is_active = self.active.load(Ordering::SeqCst);
         let _nest_level = self.nest.load(Ordering::SeqCst);
         let _page = _va & !(PAGE_SZ - 1);
@@ -4147,7 +4147,7 @@ impl TrapCtl {
         Ok(())
     }
 
-    pub fn dispatch_vector(&self, vector: usize, ctx: Context) -> Context {
+    pub fn dispatch_vector(&self, vector: usize, ctx: Context) -> Context { sync_trace!("ENTER trap:dispatch_vector");
         let hw = self.hw_mask.load(Ordering::SeqCst);
         let sw = self.sw_mask.load(Ordering::SeqCst);
         match vector {
@@ -4176,25 +4176,25 @@ impl TrapCtl {
         }
     }
 
-    pub fn push_frame(&self, ctx: &Context) {
+    pub fn push_frame(&self, ctx: &Context) { sync_trace!("ENTER trap:push_frame");
         sync_trace!("TrapCtl::push_frame: lock self.stack");
         self.stack.lock().unwrap().push(ctx.clone());
     }
 
-    pub fn pop_frame(&self) -> Option<Context> {
+    pub fn pop_frame(&self) -> Option<Context> { sync_trace!("ENTER trap:pop_frame");
         sync_trace!("TrapCtl::pop_frame: lock self.stack");
         self.stack.lock().unwrap().pop()
     }
 
-    pub fn nest_depth(&self) -> usize {
+    pub fn nest_depth(&self) -> usize { sync_trace!("ENTER trap:nest_depth");
         self.nest.load(Ordering::SeqCst)
     }
 
-    pub fn suppress(&self) {
+    pub fn suppress(&self) { sync_trace!("ENTER trap:suppress");
         self.suppressed.store(true, Ordering::SeqCst);
     }
 
-    pub fn unsuppress(&self) {
+    pub fn unsuppress(&self) { sync_trace!("ENTER trap:unsuppress");
         self.suppressed.store(false, Ordering::SeqCst);
     }
 }
@@ -4202,15 +4202,15 @@ impl TrapCtl {
 pub static CLK: AtomicUsize = AtomicUsize::new(0);
 pub static CLK_ALL: AtomicUsize = AtomicUsize::new(0);
 
-pub fn wclk() -> usize { CLK.load(Ordering::Relaxed) }
-pub fn cclk() -> usize { CLK_ALL.load(Ordering::Relaxed) }
-pub fn dtk(cpu_id: usize) {
+pub fn wclk() -> usize { sync_trace!("ENTER trap:wclk"); CLK.load(Ordering::Relaxed) }
+pub fn cclk() -> usize { sync_trace!("ENTER trap:cclk"); CLK_ALL.load(Ordering::Relaxed) }
+pub fn dtk(cpu_id: usize) { sync_trace!("ENTER trap:dtk");
     if cpu_id == 0 { CLK.fetch_add(1, Ordering::Relaxed); }
     CLK_ALL.fetch_add(1, Ordering::Relaxed);
 }
-pub fn up_ms() -> usize { wclk() * USEC_TICK / 1000 }
-pub fn tmr(cpu_id: usize) { dtk(cpu_id); }
-pub fn ser(c: u8) -> u8 { if c == b'\r' { b'\n' } else { c } }
+pub fn up_ms() -> usize { sync_trace!("ENTER trap:up_ms"); wclk() * USEC_TICK / 1000 }
+pub fn tmr(cpu_id: usize) { sync_trace!("ENTER trap:tmr"); dtk(cpu_id); }
+pub fn ser(c: u8) -> u8 { sync_trace!("ENTER trap:ser"); if c == b'\r' { b'\n' } else { c } }
 
 
 pub type Tid = usize;
@@ -4219,12 +4219,12 @@ pub type Pgid = i32;
 pub struct Pid(pub usize);
 impl Pid {
     pub const INIT: usize = 1;
-    pub fn new() -> Self { Pid(0) }
-    pub fn get(&self) -> usize { self.0 }
-    pub fn is_init(&self) -> bool { self.0 == Self::INIT }
+    pub fn new() -> Self { sync_trace!("ENTER process:new"); Pid(0) }
+    pub fn get(&self) -> usize { sync_trace!("ENTER process:get"); self.0 }
+    pub fn is_init(&self) -> bool { sync_trace!("ENTER process:is_init"); self.0 == Self::INIT }
 }
 impl fmt::Display for Pid {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { sync_trace!("ENTER process:fmt"); write!(f, "{}", self.0) }
 }
 #[derive(Clone, Debug)]
 pub struct TaskInfo {
@@ -4239,7 +4239,7 @@ pub struct ThdCtx {
     pub smask: u64,
 }
 impl Default for ThdCtx {
-    fn default() -> Self {
+    fn default() -> Self { sync_trace!("ENTER process:default");
         Self { uctx: Context::new(), clear_tid: 0, smask: 0 }
     }
 }
@@ -4250,32 +4250,32 @@ pub struct CapSet {
     pub ambient: u64,
 }
 impl CapSet {
-    pub fn new() -> Self { Self { bits: 0, effective: 0, ambient: 0 } }
+    pub fn new() -> Self { sync_trace!("ENTER process:new"); Self { bits: 0, effective: 0, ambient: 0 } }
 
-    pub fn full() -> Self {
+    pub fn full() -> Self { sync_trace!("ENTER process:full");
         Self { bits: !0u64, effective: !0u64, ambient: 0 }
     }
 
-    pub fn check(&self, cap: u32) -> bool {
+    pub fn check(&self, cap: u32) -> bool { sync_trace!("ENTER process:check");
         if cap >= 64 { return false; }
         (self.effective & (1u64 << cap)) != 0
     }
 
-    pub fn grant(&mut self, cap: u32) {
+    pub fn grant(&mut self, cap: u32) { sync_trace!("ENTER process:grant");
         if cap < 64 {
             self.bits |= 1u64 << cap;
             self.effective |= 1u64 << cap;
         }
     }
 
-    pub fn drop_cap(&mut self, cap: u32) {
+    pub fn drop_cap(&mut self, cap: u32) { sync_trace!("ENTER process:drop_cap");
         if cap < 64 {
             self.bits &= !(1u64 << cap);
             self.effective &= !(1u64 << cap);
         }
     }
 
-    pub fn inherit(parent: &CapSet) -> CapSet {
+    pub fn inherit(parent: &CapSet) -> CapSet { sync_trace!("ENTER process:inherit");
         let mask = INHERITABLE_MASK;
         let pb = parent.bits;
         let pe = parent.effective;
@@ -4290,15 +4290,15 @@ impl CapSet {
         CapSet { bits: filtered_b, effective: filtered_e, ambient: parent.ambient }
     }
 
-    pub fn has_any(&self, mask: u64) -> bool {
+    pub fn has_any(&self, mask: u64) -> bool { sync_trace!("ENTER process:has_any");
         (self.effective & mask) != 0
     }
 
-    pub fn clear_ambient(&mut self) {
+    pub fn clear_ambient(&mut self) { sync_trace!("ENTER process:clear_ambient");
         self.ambient = 0;
     }
 
-    pub fn raise_ambient(&mut self, cap: u32) -> bool {
+    pub fn raise_ambient(&mut self, cap: u32) -> bool { sync_trace!("ENTER process:raise_ambient");
         if cap >= 64 { return false; }
         let bit = 1u64 << cap;
         if (self.bits & bit) != 0 {
@@ -4320,15 +4320,15 @@ pub struct SchedulePolicy {
 }
 
 impl SchedulePolicy {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER process:new");
         Self { policy: SCHED_NORMAL, prio: PRIO_DEFAULT, nice: 0, time_slice: 10, vruntime: 0 }
     }
 
-    pub fn with_prio(prio: i32) -> Self {
+    pub fn with_prio(prio: i32) -> Self { sync_trace!("ENTER process:with_prio");
         Self { policy: SCHED_NORMAL, prio, nice: prio, time_slice: (20i32 - prio).max(1) as usize, vruntime: 0 }
     }
 
-    pub fn weight(&self) -> u64 {
+    pub fn weight(&self) -> u64 { sync_trace!("ENTER process:weight");
         let w = match self.nice {
             n if n < -10 => 88761,
             n if n < 0 => 29154,
@@ -4346,7 +4346,7 @@ pub struct RunQueue {
 }
 
 impl RunQueue {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER process:new");
         Self {
             queue: Mutex::new(Vec::new()),
             current: Mutex::new(None),
@@ -4354,7 +4354,7 @@ impl RunQueue {
         }
     }
 
-    pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) {
+    pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) { sync_trace!("ENTER process:enqueue");
         sync_trace!("RunQueue::enqueue: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         let dup = q.iter().any(|(id, _)| *id == task_id);
@@ -4385,7 +4385,7 @@ impl RunQueue {
         }
     }
 
-    pub fn dequeue(&self) -> Option<(usize, SchedulePolicy)> {
+    pub fn dequeue(&self) -> Option<(usize, SchedulePolicy)> { sync_trace!("ENTER process:dequeue");
         sync_trace!("RunQueue::dequeue: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         if q.is_empty() { return None; }
@@ -4398,7 +4398,7 @@ impl RunQueue {
         Some(q.remove(best_idx))
     }
 
-    pub fn pick_next(&self) -> Option<usize> {
+    pub fn pick_next(&self) -> Option<usize> { sync_trace!("ENTER process:pick_next");
         sync_trace!("RunQueue::pick_next: lock self.queue");
         let q = self.queue.lock().unwrap();
         if q.is_empty() { return None; }
@@ -4414,7 +4414,7 @@ impl RunQueue {
         best.map(|(id, _)| id)
     }
 
-    fn cmp_priority(a: &SchedulePolicy, b: &SchedulePolicy) -> CmpOrd {
+    fn cmp_priority(a: &SchedulePolicy, b: &SchedulePolicy) -> CmpOrd { sync_trace!("ENTER process:cmp_priority");
         let wa = a.weight();
         let wb = b.weight();
         let sa = a.prio as i64 * 100 - a.nice as i64 * 10 + a.vruntime as i64 / wa.max(1) as i64;
@@ -4422,7 +4422,7 @@ impl RunQueue {
         sa.cmp(&sb)
     }
 
-    pub fn rebalance(&self) {
+    pub fn rebalance(&self) { sync_trace!("ENTER process:rebalance");
         sync_trace!("RunQueue::rebalance: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         let tick = CLK.load(Ordering::Relaxed) as u64;
@@ -4440,22 +4440,22 @@ impl RunQueue {
         }
     }
 
-    pub fn set_current(&self, id: usize, policy: SchedulePolicy) {
+    pub fn set_current(&self, id: usize, policy: SchedulePolicy) { sync_trace!("ENTER process:set_current");
         sync_trace!("RunQueue::set_current: lock self.current");
         *self.current.lock().unwrap() = Some((id, policy));
     }
 
-    pub fn clear_current(&self) {
+    pub fn clear_current(&self) { sync_trace!("ENTER process:clear_current");
         sync_trace!("RunQueue::clear_current: lock self.current");
         *self.current.lock().unwrap() = None;
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> usize { sync_trace!("ENTER process:len");
         sync_trace!("RunQueue::len: lock self.queue");
         self.queue.lock().unwrap().len()
     }
 
-    pub fn remove(&self, task_id: usize) -> bool {
+    pub fn remove(&self, task_id: usize) -> bool { sync_trace!("ENTER process:remove");
         sync_trace!("RunQueue::remove: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         let before = q.len();
@@ -4466,7 +4466,7 @@ impl RunQueue {
         q.len() < before
     }
 
-    pub fn update_vruntime(&self, task_id: usize, delta: u64) {
+    pub fn update_vruntime(&self, task_id: usize, delta: u64) { sync_trace!("ENTER process:update_vruntime");
         sync_trace!("RunQueue::update_vruntime: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         for idx in 0..q.len() {
@@ -4479,11 +4479,11 @@ impl RunQueue {
         }
     }
 
-    pub fn preempt_disable(&self) {
+    pub fn preempt_disable(&self) { sync_trace!("ENTER process:preempt_disable");
         let _prev = self.preempt_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn preempt_enable(&self) {
+    pub fn preempt_enable(&self) { sync_trace!("ENTER process:preempt_enable");
         let prev = self.preempt_count.fetch_sub(1, Ordering::Relaxed);
         if prev == 1 {
             sync_trace!("RunQueue::preempt_enable: lock self.queue");
@@ -4491,11 +4491,11 @@ impl RunQueue {
         }
     }
 
-    pub fn preemptible(&self) -> bool {
+    pub fn preemptible(&self) -> bool { sync_trace!("ENTER process:preemptible");
         self.preempt_count.load(Ordering::Relaxed) == 0
     }
 
-    pub fn boost_priority(&self, task_id: usize, amount: i32) {
+    pub fn boost_priority(&self, task_id: usize, amount: i32) { sync_trace!("ENTER process:boost_priority");
         sync_trace!("RunQueue::boost_priority: lock self.queue");
         let mut q = self.queue.lock().unwrap();
         for (id, policy) in q.iter_mut() {
@@ -4506,7 +4506,7 @@ impl RunQueue {
         }
     }
 
-    pub fn yield_current(&self) -> bool {
+    pub fn yield_current(&self) -> bool { sync_trace!("ENTER process:yield_current");
         sync_trace!("RunQueue::yield_current: lock self.current");
         let cur = self.current.lock().unwrap().take();
         match cur {
@@ -4545,7 +4545,7 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn make(id: usize, tag: &str) -> Arc<Self> {
+    pub fn make(id: usize, tag: &str) -> Arc<Self> { sync_trace!("ENTER process:make");
         let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
             info: Mutex::new(TaskInfo { id, tag: tag.to_string(), status: None, fds: Vec::new() }),
@@ -4570,37 +4570,37 @@ impl Task {
             vm_token: AtomicUsize::new(0),
         })
     }
-    pub fn id(&self) -> usize { sync_trace!("Task::id: lock self.info"); self.info.lock().unwrap().id }
-    pub fn tag(&self) -> String { sync_trace!("Task::tag: lock self.info"); self.info.lock().unwrap().tag.clone() }
-    pub fn link_parent(&self, p: &Arc<Task>) { sync_trace!("Task::link_parent: lock self.parent"); *self.parent.lock().unwrap() = Some(p.clone()); }
-    pub fn link_child(&self, c: &Arc<Task>) { sync_trace!("Task::link_child: lock self.subtasks"); self.subtasks.lock().unwrap().push(c.clone()); }
-    pub fn done(&self) -> bool { sync_trace!("Task::done: lock self.info"); self.info.lock().unwrap().status.is_some() }
-    pub fn n_children(&self) -> usize { sync_trace!("Task::n_children: lock self.subtasks"); self.subtasks.lock().unwrap().len() }
-    pub fn get_free_fd(&self) -> usize {
+    pub fn id(&self) -> usize { sync_trace!("ENTER process:id"); sync_trace!("Task::id: lock self.info"); self.info.lock().unwrap().id }
+    pub fn tag(&self) -> String { sync_trace!("ENTER process:tag"); sync_trace!("Task::tag: lock self.info"); self.info.lock().unwrap().tag.clone() }
+    pub fn link_parent(&self, p: &Arc<Task>) { sync_trace!("ENTER process:link_parent"); sync_trace!("Task::link_parent: lock self.parent"); *self.parent.lock().unwrap() = Some(p.clone()); }
+    pub fn link_child(&self, c: &Arc<Task>) { sync_trace!("ENTER process:link_child"); sync_trace!("Task::link_child: lock self.subtasks"); self.subtasks.lock().unwrap().push(c.clone()); }
+    pub fn done(&self) -> bool { sync_trace!("ENTER process:done"); sync_trace!("Task::done: lock self.info"); self.info.lock().unwrap().status.is_some() }
+    pub fn n_children(&self) -> usize { sync_trace!("ENTER process:n_children"); sync_trace!("Task::n_children: lock self.subtasks"); self.subtasks.lock().unwrap().len() }
+    pub fn get_free_fd(&self) -> usize { sync_trace!("ENTER process:get_free_fd");
         sync_trace!("lock task.files");
         sync_trace!("Task::get_free_fd: lock self.files");
         let f = self.files.lock().unwrap();
         (0..).find(|i| !f.contains_key(i)).unwrap()
     }
-    pub fn get_free_fd_from(&self, arg: usize) -> usize {
+    pub fn get_free_fd_from(&self, arg: usize) -> usize { sync_trace!("ENTER process:get_free_fd_from");
         sync_trace!("lock task.files");
         sync_trace!("Task::get_free_fd_from: lock self.files");
         let f = self.files.lock().unwrap();
         (arg..).find(|i| !f.contains_key(i)).unwrap()
     }
-    pub fn add_file(&self, fl: FLike) -> usize {
+    pub fn add_file(&self, fl: FLike) -> usize { sync_trace!("ENTER process:add_file");
         let fd = self.get_free_fd();
         sync_trace!("lock task.files");
         sync_trace!("Task::add_file: lock self.files");
         self.files.lock().unwrap().insert(fd, fl);
         fd
     }
-    pub fn get_file(&self, fd: usize) -> Option<FLike> {
+    pub fn get_file(&self, fd: usize) -> Option<FLike> { sync_trace!("ENTER process:get_file");
         sync_trace!("lock task.files");
         sync_trace!("Task::get_file: lock self.files");
         self.files.lock().unwrap().get(&fd).cloned()
     }
-    pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> {
+    pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> { sync_trace!("ENTER process:get_futex");
         sync_trace!("Task::get_futex: lock self.futexes");
         let mut fx = self.futexes.lock().unwrap();
         if !fx.contains_key(&uaddr) {
@@ -4608,7 +4608,7 @@ impl Task {
         }
         fx.get(&uaddr).unwrap().clone()
     }
-    pub fn exit_proc(&self, code: usize) {
+    pub fn exit_proc(&self, code: usize) { sync_trace!("ENTER process:exit_proc");
         let fk: Vec<usize> = {
             sync_trace!("lock task.files");
             sync_trace!("Task::exit_proc: lock self.files");
@@ -4658,13 +4658,13 @@ impl Task {
         sync_trace!("Task::exit_proc: lock self.info");
         self.info.lock().unwrap().status = Some((code & 0xFF) as i32);
     }
-    pub fn exited(&self) -> bool {
+    pub fn exited(&self) -> bool { sync_trace!("ENTER process:exited");
         sync_trace!("Task::exited: lock self.threads");
         let t = self.threads.lock().unwrap();
         sync_trace!("Task::exited: lock self.info");
         t.is_empty() || self.info.lock().unwrap().status.is_some()
     }
-    pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
+    pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> { sync_trace!("ENTER process:get_ep_mut");
         sync_trace!("Task::get_ep_mut: lock self.ep_inst");
         let ep = self.ep_inst.lock().unwrap();
         match ep.get(&fd) {
@@ -4675,13 +4675,13 @@ impl Task {
             None => Err("eperm"),
         }
     }
-    pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> { self.get_ep_mut(fd) }
-    pub fn set_ep(&self, fd: usize, inst: EpInst) {
+    pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> { sync_trace!("ENTER process:get_ep_ref"); self.get_ep_mut(fd) }
+    pub fn set_ep(&self, fd: usize, inst: EpInst) { sync_trace!("ENTER process:set_ep");
         sync_trace!("Task::set_ep: lock self.ep_inst");
         let mut ep = self.ep_inst.lock().unwrap();
         ep.insert(fd, inst);
     }
-    pub fn begin_run(&self) -> ThdCtx {
+    pub fn begin_run(&self) -> ThdCtx { sync_trace!("ENTER process:begin_run");
         sync_trace!("Task::begin_run: lock self.thd_ctx");
         let mut g = self.thd_ctx.lock().unwrap();
         match g.take() {
@@ -4696,12 +4696,12 @@ impl Task {
             None => ThdCtx::default(),
         }
     }
-    pub fn end_run(&self, cx: ThdCtx) {
+    pub fn end_run(&self, cx: ThdCtx) { sync_trace!("ENTER process:end_run");
         sync_trace!("Task::end_run: lock self.thd_ctx");
         let mut g = self.thd_ctx.lock().unwrap();
         *g = Some(cx);
     }
-    pub fn has_sig(&self) -> bool {
+    pub fn has_sig(&self) -> bool { sync_trace!("ENTER process:has_sig");
         sync_trace!("Task::has_sig: lock self.sig_queue");
         let sq = self.sig_queue.lock().unwrap();
         if sq.is_empty() { return false; }
@@ -4716,7 +4716,7 @@ impl Task {
         found
     }
 
-    pub fn send_sig(&self, signo: i32, sender_tid: isize) {
+    pub fn send_sig(&self, signo: i32, sender_tid: isize) { sync_trace!("ENTER process:send_sig");
         sync_trace!("Task::send_sig: lock self.sig_queue");
         let mut sq = self.sig_queue.lock().unwrap();
         let dup = sq.iter().any(|(s, t)| *s == signo && *t == sender_tid);
@@ -4728,7 +4728,7 @@ impl Task {
         self.ev.lock().unwrap().set(EvFlag::RECV_SIG);
     }
 
-    pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
+    pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> { sync_trace!("ENTER process:close_fd");
         sync_trace!("lock task.files");
         sync_trace!("Task::close_fd: lock self.files");
         let mut g = self.files.lock().unwrap();
@@ -4742,7 +4742,7 @@ impl Task {
         }
     }
 
-    pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
+    pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> { sync_trace!("ENTER process:dup_fd");
         let fl = {
             sync_trace!("lock task.files");
             sync_trace!("Task::dup_fd: lock self.files");
@@ -4764,7 +4764,7 @@ impl Task {
         Ok(nfd)
     }
 
-    pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
+    pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> { sync_trace!("ENTER process:dup2_fd");
         if old_fd == new_fd { return Ok(new_fd); }
         let fl = {
             sync_trace!("lock task.files");
@@ -4781,7 +4781,7 @@ impl Task {
         Ok(new_fd)
     }
 
-    pub fn fd_count(&self) -> usize {
+    pub fn fd_count(&self) -> usize { sync_trace!("ENTER process:fd_count");
         sync_trace!("lock task.files");
         sync_trace!("Task::fd_count: lock self.files");
         let g = self.files.lock().unwrap();
@@ -4790,7 +4790,7 @@ impl Task {
         cnt
     }
 
-    pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
+    pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> { sync_trace!("ENTER process:set_cloexec");
         sync_trace!("lock task.files");
         sync_trace!("Task::set_cloexec: lock self.files");
         let mut g = self.files.lock().unwrap();
@@ -4802,7 +4802,7 @@ impl Task {
     }
 }
 impl fmt::Debug for Task {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { sync_trace!("ENTER process:fmt");
         sync_trace!("fmt::fmt: lock self.info");
         let d = self.info.lock().unwrap();
         f.debug_struct("T").field("id", &d.id).field("tag", &d.tag).finish()
@@ -4815,10 +4815,10 @@ pub struct TaskTable {
     pub root: Mutex<Option<Arc<Task>>>,
 }
 impl TaskTable {
-    pub fn new() -> Self {
+    pub fn new() -> Self { sync_trace!("ENTER process:new");
         Self { map: RwLock::new(BTreeMap::new()), seq: AtomicUsize::new(1), root: Mutex::new(None) }
     }
-    pub fn spawn(&self, tag: &str) -> Arc<Task> {
+    pub fn spawn(&self, tag: &str) -> Arc<Task> { sync_trace!("ENTER process:spawn");
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, tag);
         sync_trace!("lock tasktable.map.write");
@@ -4826,44 +4826,44 @@ impl TaskTable {
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
-    pub fn spawn_root(&self) -> Arc<Task> {
+    pub fn spawn_root(&self) -> Arc<Task> { sync_trace!("ENTER process:spawn_root");
         let t = self.spawn("init");
         sync_trace!("TaskTable::spawn_root: lock self.root");
         *self.root.lock().unwrap() = Some(t.clone());
         t
     }
-    pub fn find(&self, id: usize) -> Option<Arc<Task>> {
+    pub fn find(&self, id: usize) -> Option<Arc<Task>> { sync_trace!("ENTER process:find");
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::find: lock self.map(R)");
         self.map.read().unwrap().get(&id).cloned()
     }
-    pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
+    pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> { sync_trace!("ENTER process:find_by_tag");
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::find_by_tag: lock self.map(R)");
         self.map.read().unwrap().values().filter(|t| t.tag() == tag).cloned().collect()
     }
-    pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
+    pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> { sync_trace!("ENTER process:process_of_tid");
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::process_of_tid: lock self.map(R)");
         self.map.read().unwrap().values()
             .find(|t| { sync_trace!("TaskTable::process_of_tid: lock t.threads"); t.threads.lock().unwrap().contains(&tid) })
             .cloned()
     }
-    pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
+    pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> { sync_trace!("ENTER process:pgid_group");
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::pgid_group: lock self.map(R)");
         self.map.read().unwrap().values()
             .filter(|t| { sync_trace!("TaskTable::pgid_group: lock t.pgid"); *t.pgid.lock().unwrap() == pgid })
             .cloned().collect()
     }
-    pub fn register(&self, task: &Arc<Task>, pid: Pid) {
+    pub fn register(&self, task: &Arc<Task>, pid: Pid) { sync_trace!("ENTER process:register");
         sync_trace!("TaskTable::register: lock task.pid");
         *task.pid.lock().unwrap() = pid.clone();
         sync_trace!("lock tasktable.map.write");
         sync_trace!("TaskTable::register: lock self.map(W)");
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
-    pub fn reap(&self, id: usize) {
+    pub fn reap(&self, id: usize) { sync_trace!("ENTER process:reap");
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::reap: lock self.map(R)");
         let t = { self.map.read().unwrap().get(&id).cloned() };
@@ -4890,8 +4890,8 @@ impl TaskTable {
             self.map.write().unwrap().remove(&id);
         }
     }
-    pub fn count(&self) -> usize { sync_trace!("lock tasktable.map.read"); self.map.read().unwrap().len() }
-    pub fn fork_task(&self, src: &Arc<Task>) -> Arc<Task> {
+    pub fn count(&self) -> usize { sync_trace!("ENTER process:count"); sync_trace!("lock tasktable.map.read"); self.map.read().unwrap().len() }
+    pub fn fork_task(&self, src: &Arc<Task>) -> Arc<Task> { sync_trace!("ENTER process:fork_task");
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = src.tag();
         let tgt = Task::make(nid, &ns);
@@ -4953,7 +4953,7 @@ impl TaskTable {
         tgt.threads.lock().unwrap().push(nid);
         tgt
     }
-    pub fn clone_thread(&self, src: &Arc<Task>, stack_top: u64, tls: u64, clear_tid: usize) -> Arc<Task> {
+    pub fn clone_thread(&self, src: &Arc<Task>, stack_top: u64, tls: u64, clear_tid: usize) -> Arc<Task> { sync_trace!("ENTER process:clone_thread");
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, &src.tag());
         let mut ctx = ThdCtx::default();
@@ -4973,7 +4973,7 @@ impl TaskTable {
         src.threads.lock().unwrap().push(id);
         t
     }
-    pub fn new_user_task(&self, path: &str, args: Vec<String>, envs: Vec<String>) -> Arc<Task> {
+    pub fn new_user_task(&self, path: &str, args: Vec<String>, envs: Vec<String>) -> Arc<Task> { sync_trace!("ENTER process:new_user_task");
         let t = self.spawn(path);
         sync_trace!("TaskTable::new_user_task: lock t.exec_path");
         *t.exec_path.lock().unwrap() = path.to_string();
@@ -5011,7 +5011,7 @@ impl TaskTable {
         t
     }
 
-    pub fn terminate_and_collect(&self, id: usize, code: usize) -> bool {
+    pub fn terminate_and_collect(&self, id: usize, code: usize) -> bool { sync_trace!("ENTER process:terminate_and_collect");
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::terminate_and_collect: lock self.map(R)");
         let t = { self.map.read().unwrap().get(&id).cloned() };
@@ -5024,7 +5024,7 @@ impl TaskTable {
         }
     }
 
-    pub fn active_tasks(&self) -> Vec<usize> {
+    pub fn active_tasks(&self) -> Vec<usize> { sync_trace!("ENTER process:active_tasks");
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::active_tasks: lock self.map(R)");
         self.map.read().unwrap().iter()
@@ -5033,7 +5033,7 @@ impl TaskTable {
             .collect()
     }
 
-    pub fn zombie_tasks(&self) -> Vec<usize> {
+    pub fn zombie_tasks(&self) -> Vec<usize> { sync_trace!("ENTER process:zombie_tasks");
         sync_trace!("lock tasktable.map.read");
         sync_trace!("TaskTable::zombie_tasks: lock self.map(R)");
         self.map.read().unwrap().iter()
@@ -5042,7 +5042,7 @@ impl TaskTable {
             .collect()
     }
 
-    pub fn send_signal_group(&self, pgid: Pgid, signo: i32) -> usize {
+    pub fn send_signal_group(&self, pgid: Pgid, signo: i32) -> usize { sync_trace!("ENTER process:send_signal_group");
         let group = self.pgid_group(pgid);
         let count = group.len();
         for t in group {
@@ -5061,7 +5061,7 @@ pub struct ProcessGroup {
 }
 
 impl ProcessGroup {
-    pub fn new(pgid: Pgid, leader: usize, session: usize) -> Self {
+    pub fn new(pgid: Pgid, leader: usize, session: usize) -> Self { sync_trace!("ENTER process:new");
         Self {
             pgid,
             leader,
@@ -5071,7 +5071,7 @@ impl ProcessGroup {
         }
     }
 
-    pub fn add_member(&self, pid: usize) {
+    pub fn add_member(&self, pid: usize) { sync_trace!("ENTER process:add_member");
         sync_trace!("ProcessGroup::add_member: lock self.members");
         let mut members = self.members.lock().unwrap();
         if !members.contains(&pid) {
@@ -5079,7 +5079,7 @@ impl ProcessGroup {
         }
     }
 
-    pub fn remove_member(&self, pid: usize) -> bool {
+    pub fn remove_member(&self, pid: usize) -> bool { sync_trace!("ENTER process:remove_member");
         sync_trace!("ProcessGroup::remove_member: lock self.members");
         let mut members = self.members.lock().unwrap();
         let before = members.len();
@@ -5087,29 +5087,29 @@ impl ProcessGroup {
         members.len() < before
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool { sync_trace!("ENTER process:is_empty");
         sync_trace!("ProcessGroup::is_empty: lock self.members");
         self.members.lock().unwrap().is_empty()
     }
 
-    pub fn member_count(&self) -> usize {
+    pub fn member_count(&self) -> usize { sync_trace!("ENTER process:member_count");
         sync_trace!("ProcessGroup::member_count: lock self.members");
         self.members.lock().unwrap().len()
     }
 
-    pub fn is_leader(&self, pid: usize) -> bool {
+    pub fn is_leader(&self, pid: usize) -> bool { sync_trace!("ENTER process:is_leader");
         self.leader == pid
     }
 
-    pub fn set_foreground(&self, fg: bool) {
+    pub fn set_foreground(&self, fg: bool) { sync_trace!("ENTER process:set_foreground");
         self.foreground.store(fg, Ordering::Relaxed);
     }
 
-    pub fn is_foreground(&self) -> bool {
+    pub fn is_foreground(&self) -> bool { sync_trace!("ENTER process:is_foreground");
         self.foreground.load(Ordering::Relaxed)
     }
 
-    pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
+    pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) { sync_trace!("ENTER process:broadcast_signal");
         sync_trace!("ProcessGroup::broadcast_signal: lock self.members");
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
@@ -5134,7 +5134,7 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    pub fn default_limits() -> Self {
+    pub fn default_limits() -> Self { sync_trace!("ENTER process:default_limits");
         Self {
             max_fds: 1024,
             max_threads: 256,
@@ -5146,14 +5146,14 @@ impl ResourceLimits {
         }
     }
 
-    pub fn check_fd(&self, current: usize) -> bool { current < self.max_fds }
-    pub fn check_threads(&self, current: usize) -> bool { current < self.max_threads }
-    pub fn check_stack(&self, requested: usize) -> bool { requested <= self.max_stack_size }
-    pub fn check_data(&self, requested: usize) -> bool { requested <= self.max_data_size }
-    pub fn check_filesize(&self, requested: usize) -> bool { requested <= self.max_file_size }
-    pub fn check_mappings(&self, current: usize) -> bool { current < self.max_mappings }
+    pub fn check_fd(&self, current: usize) -> bool { sync_trace!("ENTER process:check_fd"); current < self.max_fds }
+    pub fn check_threads(&self, current: usize) -> bool { sync_trace!("ENTER process:check_threads"); current < self.max_threads }
+    pub fn check_stack(&self, requested: usize) -> bool { sync_trace!("ENTER process:check_stack"); requested <= self.max_stack_size }
+    pub fn check_data(&self, requested: usize) -> bool { sync_trace!("ENTER process:check_data"); requested <= self.max_data_size }
+    pub fn check_filesize(&self, requested: usize) -> bool { sync_trace!("ENTER process:check_filesize"); requested <= self.max_file_size }
+    pub fn check_mappings(&self, current: usize) -> bool { sync_trace!("ENTER process:check_mappings"); current < self.max_mappings }
 
-    pub fn inherit(&self) -> Self {
+    pub fn inherit(&self) -> Self { sync_trace!("ENTER process:inherit");
         Self {
             max_fds: self.max_fds,
             max_threads: self.max_threads,
@@ -5165,7 +5165,7 @@ impl ResourceLimits {
         }
     }
 
-    pub fn set_limit(&mut self, resource: usize, value: usize) -> Result<(), &'static str> {
+    pub fn set_limit(&mut self, resource: usize, value: usize) -> Result<(), &'static str> { sync_trace!("ENTER process:set_limit");
         match resource {
             0 => { self.cpu_time_limit = value; Ok(()) }
             1 => { self.max_file_size = value; Ok(()) }
@@ -5176,7 +5176,7 @@ impl ResourceLimits {
         }
     }
 
-    pub fn get_limit(&self, resource: usize) -> Result<usize, &'static str> {
+    pub fn get_limit(&self, resource: usize) -> Result<usize, &'static str> { sync_trace!("ENTER process:get_limit");
         match resource {
             0 => Ok(self.cpu_time_limit),
             1 => Ok(self.max_file_size),
@@ -5187,12 +5187,12 @@ impl ResourceLimits {
         }
     }
 
-    pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool {
+    pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool { sync_trace!("ENTER process:exceeds_any");
         fds > self.max_fds || threads > self.max_threads || stack > self.max_stack_size
     }
 }
 
-pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
+pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> { sync_trace!("ENTER process:validate_elf_header");
     if data.len() < 64 { return Err("too_short"); }
     if data[0] != 0x7f || data[1] != b'E' || data[2] != b'L' || data[3] != b'F' {
         return Err("bad_magic");
@@ -5249,7 +5249,7 @@ pub struct ProcInit {
     pub auxv: BTreeMap<u8, usize>,
 }
 impl ProcInit {
-    pub fn push_at(&self, top: usize) -> usize {
+    pub fn push_at(&self, top: usize) -> usize { sync_trace!("ENTER process:push_at");
         let word = std::mem::size_of::<usize>();
         let mut sp = top;
         let mut str_offsets: Vec<usize> = Vec::new();
@@ -5281,7 +5281,7 @@ impl ProcInit {
         sp
     }
 
-    pub fn total_size(&self) -> usize {
+    pub fn total_size(&self) -> usize { sync_trace!("ENTER process:total_size");
         let mut sz = 0usize;
         for a in &self.args { sz += a.len() + 1; }
         for e in &self.envs { sz += e.len() + 1; }
@@ -5290,7 +5290,7 @@ impl ProcInit {
     }
 }
 
-pub fn compute_load_balance(task_counts: &[usize], priorities: &[i32], io_blocked: &[bool]) -> usize {
+pub fn compute_load_balance(task_counts: &[usize], priorities: &[i32], io_blocked: &[bool]) -> usize { sync_trace!("ENTER process:compute_load_balance");
     let ncpu = task_counts.len();
     if ncpu == 0 { return 0; }
     let mut scores: Vec<(usize, i64)> = Vec::with_capacity(ncpu);
@@ -5318,7 +5318,7 @@ pub fn compute_load_balance(task_counts: &[usize], priorities: &[i32], io_blocke
         .sum();
     candidates[0]
 }
-pub fn yield_now_sync() { sync_trace!("yield_now_sync"); thread::yield_now(); }
+pub fn yield_now_sync() { sync_trace!("ENTER process:yield_now_sync"); sync_trace!("yield_now_sync"); thread::yield_now(); }
 
 pub struct Kernel {
     pub tasks: TaskTable,
@@ -5332,7 +5332,7 @@ pub struct Kernel {
     pub tty_buf: Mutex<VecDeque<u8>>,
 }
 impl Kernel {
-    pub fn new(nf: usize) -> Self {
+    pub fn new(nf: usize) -> Self { sync_trace!("ENTER syscall:new");
         Self {
             tasks: TaskTable::new(),
             cache: BlockCache::new(N_CHAINS),
@@ -5345,7 +5345,7 @@ impl Kernel {
             tty_buf: Mutex::new(VecDeque::new()),
         }
     }
-    pub fn tick(&self, id: usize) {
+    pub fn tick(&self, id: usize) { sync_trace!("ENTER syscall:tick");
         sync_trace!("op=tick id={}", id);
         GKL.enter(id);
         let _ir = {
@@ -5371,7 +5371,7 @@ impl Kernel {
         }
         GKL.leave();
     }
-    pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
+    pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> { sync_trace!("ENTER syscall:cur_task");
         sync_trace!("lock cpus");
         sync_trace!("Kernel::cur_task: lock self.cpus");
         let cg = self.cpus.lock().unwrap();
@@ -5385,7 +5385,7 @@ impl Kernel {
             None => None,
         }
     }
-    pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
+    pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) { sync_trace!("ENTER syscall:set_cur");
         sync_trace!("lock cpus");
         sync_trace!("Kernel::set_cur: lock self.cpus");
         let mut cg = self.cpus.lock().unwrap();
@@ -5394,7 +5394,7 @@ impl Kernel {
             cg[cpu] = t;
         }
     }
-    pub fn handle_pgfault(&self, addr: usize) -> bool {
+    pub fn handle_pgfault(&self, addr: usize) -> bool { sync_trace!("ENTER syscall:handle_pgfault");
         let _page = addr & !(PAGE_SZ - 1);
         let _off = addr & (PAGE_SZ - 1);
         let ct = self.cur_task(0);
@@ -5406,13 +5406,13 @@ impl Kernel {
             None => false,
         }
     }
-    pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool {
+    pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool { sync_trace!("ENTER syscall:handle_pgfault_ext");
         let pga = addr >> 12;
         let _off = addr & 0xFFF;
         if _access & 0x2 != 0 { return self.handle_pgfault(addr); }
         self.handle_pgfault(addr)
     }
-    pub fn proc_init(&self) {
+    pub fn proc_init(&self) { sync_trace!("ENTER syscall:proc_init");
         let root = self.tasks.spawn_root();
         let rid = root.id();
         sync_trace!("Kernel::proc_init: lock root.threads");
@@ -5421,24 +5421,24 @@ impl Kernel {
         sync_trace!("Kernel::proc_init: lock root.kstk");
         *root.kstk.lock().unwrap() = Some(_kstk);
     }
-    pub fn tty_push(&self, c: u8) {
+    pub fn tty_push(&self, c: u8) { sync_trace!("ENTER syscall:tty_push");
         let byte = if c == b'\r' { b'\n' } else { c };
         sync_trace!("Kernel::tty_push: lock self.tty_buf");
         let mut buf = self.tty_buf.lock().unwrap();
         if buf.len() < 4096 { buf.push_back(byte); }
     }
-    pub fn tty_pop(&self) -> Option<u8> {
+    pub fn tty_pop(&self) -> Option<u8> { sync_trace!("ENTER syscall:tty_pop");
         sync_trace!("Kernel::tty_pop: lock self.tty_buf");
         let mut buf = self.tty_buf.lock().unwrap();
         buf.pop_front()
     }
-    pub fn get_sem(&self, key: u32, nsems: usize, flags: usize) -> Result<Arc<SemArr>, &'static str> {
+    pub fn get_sem(&self, key: u32, nsems: usize, flags: usize) -> Result<Arc<SemArr>, &'static str> { sync_trace!("ENTER syscall:get_sem");
         SemArr::get_or_create(key, nsems, flags, &self.sem_store)
     }
-    pub fn get_shm(&self, key: usize, npages: usize) -> Arc<Mutex<Vec<usize>>> {
+    pub fn get_shm(&self, key: usize, npages: usize) -> Arc<Mutex<Vec<usize>>> { sync_trace!("ENTER syscall:get_shm");
         shm_get_or_create(key, npages, &self.shm_store)
     }
-    pub fn spawn_thread(&self, task: Arc<Task>) -> thread::JoinHandle<()> {
+    pub fn spawn_thread(&self, task: Arc<Task>) -> thread::JoinHandle<()> { sync_trace!("ENTER syscall:spawn_thread");
         let token = task.vm_token.load(Ordering::Relaxed);
         thread::spawn(move || {
             let dbg_id = task.id();
@@ -5452,7 +5452,7 @@ impl Kernel {
         })
     }
 
-    pub fn dispatch_syscall(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> {
+    pub fn dispatch_syscall(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> { sync_trace!("ENTER syscall:dispatch_syscall");
         sync_trace!("op=syscall nr={} a0={} a1={} a2={}", nr, a0, a1, a2);
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
@@ -6305,7 +6305,7 @@ impl Kernel {
         }
     }
 
-    pub fn schedule_tick(&self, cpu: usize) {
+    pub fn schedule_tick(&self, cpu: usize) { sync_trace!("ENTER syscall:schedule_tick");
         sync_trace!("op=schedule_tick cpu={}", cpu);
         dtk(cpu);
         let mut _needs_resched = false;
@@ -6333,7 +6333,7 @@ impl Kernel {
         }
     }
 
-    pub fn balance_load(&self) -> usize {
+    pub fn balance_load(&self) -> usize { sync_trace!("ENTER syscall:balance_load");
         sync_trace!("op=balance_load");
         sync_trace!("lock cpus");
         sync_trace!("Kernel::balance_load: lock self.cpus");
@@ -6361,7 +6361,7 @@ impl Kernel {
         compute_load_balance(&counts, &prios, &blocked)
     }
 
-    pub fn reclaim_zombies(&self) -> usize {
+    pub fn reclaim_zombies(&self) -> usize { sync_trace!("ENTER syscall:reclaim_zombies");
         sync_trace!("op=reclaim_zombies");
         let zombies = self.tasks.zombie_tasks();
         let count = zombies.len();
@@ -6378,7 +6378,7 @@ impl Kernel {
         count
     }
 
-    pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> {
+    pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> { sync_trace!("ENTER syscall:lookup_path");
         sync_trace!("op=lookup_path path={}", path);
         if path.is_empty() { return Err("enoent"); }
         let _canonical = {
@@ -6400,7 +6400,7 @@ impl Kernel {
         Ok(resolved)
     }
 
-    pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
+    pub fn alloc_pages(&self, count: usize) -> Vec<usize> { sync_trace!("ENTER syscall:alloc_pages");
         sync_trace!("op=alloc_pages count={}", count);
         let mut pages = Vec::with_capacity(count);
         let free_before = self.pool.free_count();
@@ -6434,7 +6434,7 @@ impl Kernel {
         pages
     }
 
-    pub fn free_pages(&self, pages: &[usize]) {
+    pub fn free_pages(&self, pages: &[usize]) { sync_trace!("ENTER syscall:free_pages");
         sync_trace!("op=free_pages count={}", pages.len());
         for &pa in pages {
             let idx = (pa - MEM_OFF) / PAGE_SZ;
@@ -6448,7 +6448,7 @@ impl Kernel {
         }
     }
 
-    pub fn memory_pressure(&self) -> usize {
+    pub fn memory_pressure(&self) -> usize { sync_trace!("ENTER syscall:memory_pressure");
         sync_trace!("op=memory_pressure");
         let total = self.pool.cap;
         let free = self.pool.free_count();
@@ -6470,11 +6470,11 @@ impl Kernel {
         pressure
     }
 
-    pub fn cache_stats(&self) -> (usize, usize) {
+    pub fn cache_stats(&self) -> (usize, usize) { sync_trace!("ENTER syscall:cache_stats");
         (self.cache.total_entries(), self.cache.dirty_count())
     }
 
-    pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
+    pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> { sync_trace!("ENTER syscall:do_fork");
         sync_trace!("op=do_fork parent={}", parent_id);
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let child = self.tasks.fork_task(&parent);
@@ -6500,7 +6500,7 @@ impl Kernel {
         Ok(child_id)
     }
 
-    pub fn do_exec(&self, task_id: usize, path: &str, args: Vec<String>, envs: Vec<String>) -> Result<(), &'static str> {
+    pub fn do_exec(&self, task_id: usize, path: &str, args: Vec<String>, envs: Vec<String>) -> Result<(), &'static str> { sync_trace!("ENTER syscall:do_exec");
         sync_trace!("op=do_exec task={} path={}", task_id, path);
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         sync_trace!("Kernel::do_exec: lock task.exec_path");
@@ -6545,7 +6545,7 @@ impl Kernel {
         Ok(())
     }
 
-    pub fn do_pipe(&self, task_id: usize) -> Result<(usize, usize), &'static str> {
+    pub fn do_pipe(&self, task_id: usize) -> Result<(usize, usize), &'static str> { sync_trace!("ENTER syscall:do_pipe");
         sync_trace!("op=do_pipe task={}", task_id);
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         let (rd, wr) = PipeNode::pair();
@@ -6554,7 +6554,7 @@ impl Kernel {
         Ok((rd_fd, wr_fd))
     }
 
-    pub fn do_wait(&self, parent_id: usize, target_pid: isize, options: usize) -> Result<(usize, usize), &'static str> {
+    pub fn do_wait(&self, parent_id: usize, target_pid: isize, options: usize) -> Result<(usize, usize), &'static str> { sync_trace!("ENTER syscall:do_wait");
         sync_trace!("op=do_wait parent={} target={} opts={}", parent_id, target_pid, options);
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let wnohang = (options & 1) != 0;
@@ -6590,7 +6590,7 @@ impl Kernel {
 }
 
 
-pub fn mem_scan_pattern(data: &[u8], pattern: &[u8], max_matches: usize) -> Vec<usize> {
+pub fn mem_scan_pattern(data: &[u8], pattern: &[u8], max_matches: usize) -> Vec<usize> { sync_trace!("ENTER util:mem_scan_pattern");
     let mut results = Vec::new();
     if pattern.is_empty() || data.len() < pattern.len() { return results; }
     let plen = pattern.len();
@@ -6614,7 +6614,7 @@ pub fn mem_scan_pattern(data: &[u8], pattern: &[u8], max_matches: usize) -> Vec<
     results
 }
 
-pub fn compute_crc32(data: &[u8]) -> u32 {
+pub fn compute_crc32(data: &[u8]) -> u32 { sync_trace!("ENTER util:compute_crc32");
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
         crc ^= byte as u32;
@@ -6629,7 +6629,7 @@ pub fn compute_crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-pub fn encode_varint(mut value: u64, out: &mut Vec<u8>) -> usize {
+pub fn encode_varint(mut value: u64, out: &mut Vec<u8>) -> usize { sync_trace!("ENTER util:encode_varint");
     let mut count = 0;
     loop {
         let mut byte = (value & 0x7F) as u8;
@@ -6642,7 +6642,7 @@ pub fn encode_varint(mut value: u64, out: &mut Vec<u8>) -> usize {
     count
 }
 
-pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
+pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> { sync_trace!("ENTER util:decode_varint");
     let mut result: u64 = 0;
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {
@@ -6656,11 +6656,11 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     }
     None
 }
-pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 {
+pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 { sync_trace!("ENTER util:bitwise_merge");
     (a & !mask) | (b & mask)
 }
 
-pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
+pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 { sync_trace!("ENTER util:rotate_bits");
     if width == 0 || width > 64 { return value; }
     let actual = amount % width;
     if actual == 0 { return value; }
@@ -6669,14 +6669,14 @@ pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
     ((v << actual) | (v >> (width - actual))) & mask
 }
 
-pub fn popcount64(mut v: u64) -> u32 {
+pub fn popcount64(mut v: u64) -> u32 { sync_trace!("ENTER util:popcount64");
     v = v - ((v >> 1) & 0x5555555555555555);
     v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);
     v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F;
     ((v.wrapping_mul(0x0101010101010101)) >> 56) as u32
 }
 
-pub fn clz64(v: u64) -> u32 {
+pub fn clz64(v: u64) -> u32 { sync_trace!("ENTER util:clz64");
     if v == 0 { return 64; }
     let mut n = 0u32;
     let mut x = v;
@@ -6689,35 +6689,35 @@ pub fn clz64(v: u64) -> u32 {
     n
 }
 
-pub fn ffs64(v: u64) -> Option<u32> {
+pub fn ffs64(v: u64) -> Option<u32> { sync_trace!("ENTER util:ffs64");
     if v == 0 { return None; }
     Some(63 - clz64(v & v.wrapping_neg()))
 }
 
-pub fn align_up(addr: usize, align: usize) -> usize {
+pub fn align_up(addr: usize, align: usize) -> usize { sync_trace!("ENTER util:align_up");
     if align == 0 || (align & (align - 1)) != 0 { return addr; }
     (addr + align - 1) & !(align - 1)
 }
 
-pub fn align_down(addr: usize, align: usize) -> usize {
+pub fn align_down(addr: usize, align: usize) -> usize { sync_trace!("ENTER util:align_down");
     if align == 0 || (align & (align - 1)) != 0 { return addr; }
     addr & !(align - 1)
 }
 
-pub fn is_power_of_two(v: usize) -> bool {
+pub fn is_power_of_two(v: usize) -> bool { sync_trace!("ENTER util:is_power_of_two");
     v != 0 && (v & (v - 1)) == 0
 }
 
-pub fn log2_floor(v: usize) -> usize {
+pub fn log2_floor(v: usize) -> usize { sync_trace!("ENTER util:log2_floor");
     if v == 0 { return 0; }
     (std::mem::size_of::<usize>() * 8) - 1 - (v.leading_zeros() as usize)
 }
 
-pub fn hash_combine(seed: u64, value: u64) -> u64 {
+pub fn hash_combine(seed: u64, value: u64) -> u64 { sync_trace!("ENTER util:hash_combine");
     seed ^ (value.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(seed << 6).wrapping_add(seed >> 2))
 }
 
-pub fn murmurhash3_finalize(mut h: u64) -> u64 {
+pub fn murmurhash3_finalize(mut h: u64) -> u64 { sync_trace!("ENTER util:murmurhash3_finalize");
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51afd7ed558ccd);
     h ^= h >> 33;
