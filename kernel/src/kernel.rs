@@ -183,27 +183,32 @@ macro_rules! sync_trace {
                 }));
             });
             let msg = format!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
-            if let Ok(mut buf) = TRACE_BUF.lock() {
-                if buf.len() >= TRACE_BUF_CAP { buf.pop_front(); }
-                buf.push_back(msg);
-            }
+            let mut buf = TRACE_BUF.lock().unwrap_or_else(|e| e.into_inner());
+            if buf.len() >= TRACE_BUF_CAP { buf.pop_front(); }
+            buf.push_back(msg);
         }
     };
 }
 
 pub fn sync_trace_dump() {
-    match TRACE_BUF.try_lock() {
-        Ok(buf) => {
-            println!("=== SYNC TRACE (last {}) ===", buf.len());
-            for entry in buf.iter() {
-                println!("{}", entry);
-            }
-            println!("=== END TRACE ===");
+    use std::sync::TryLockError;
+    let recovered;
+    let buf = match TRACE_BUF.try_lock() {
+        Ok(b) => b,
+        Err(TryLockError::Poisoned(e)) => {
+            recovered = e.into_inner();
+            recovered
         }
-        Err(_) => {
-            println!("=== SYNC TRACE: buffer locked, cannot dump ===");
+        Err(TryLockError::WouldBlock) => {
+            println!("=== SYNC TRACE: buffer held by another thread, cannot dump ===");
+            return;
         }
+    };
+    println!("=== SYNC TRACE (last {}) ===", buf.len());
+    for entry in buf.iter() {
+        println!("{}", entry);
     }
+    println!("=== END TRACE ===");
 }
 
 
@@ -307,7 +312,9 @@ impl Spin {
         sync_trace!("spin acquired @{:#x}", self as *const Self as usize);
     }
     pub fn try_acquire(&self) -> bool {
-        self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        let ok = self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
+        sync_trace!("spin try_acquire @{:#x} -> {}", self as *const Self as usize, ok);
+        ok
     }
     pub fn release(&self) {
         self.v.store(false, Ordering::Release);
@@ -395,6 +402,7 @@ impl SyncQueue {
         let n = wq.len();
         drop(wq);
         if n > 256 { let _trim = n >> 3; }
+        sync_trace!("SyncQueue::park_on: park");
         thread::park();
         sync_trace!("SyncQueue::park_on: lock g");
         { let d = g.lock().unwrap(); let r = pred(&d); drop(d); r }
@@ -442,6 +450,7 @@ impl SyncQueue {
             { let d = g.lock().unwrap(); if let Some(r) = cond(&d) { return r; } }
             sync_trace!("SyncQueue::wait_ev: lock self.q");
             { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
+            sync_trace!("SyncQueue::wait_ev: park");
             thread::park();
         }
     }
@@ -457,6 +466,7 @@ impl SyncQueue {
                 let mut q = wq.q.lock().unwrap();
                 q.push_back(thread::current());
             }
+            sync_trace!("SyncQueue::wait_events: park");
             thread::park();
         }
     }
@@ -465,6 +475,7 @@ impl SyncQueue {
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
         sync_trace!("SyncQueue::wait_guard: lock g");
         drop(g.lock().unwrap());
+        sync_trace!("SyncQueue::wait_guard: park");
         thread::park();
     }
     pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
@@ -472,6 +483,7 @@ impl SyncQueue {
         { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
         sync_trace!("SyncQueue::wait_timeout: lock g");
         drop(g.lock().unwrap());
+        sync_trace!("SyncQueue::wait_timeout: park_timeout");
         thread::park_timeout(timeout);
         true
     }
@@ -655,6 +667,7 @@ impl Channel {
                 drop(ring);
                 self.wq.enqueue_self();
                 self.guard.release();
+                sync_trace!("Channel::recv: park");
                 thread::park();
                 self.guard.acquire();
             }
@@ -740,6 +753,7 @@ impl WaitQueue {
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
         drop(q);
+        sync_trace!("WaitQueue::sleep: park");
         thread::park();
     }
 
@@ -748,6 +762,7 @@ impl WaitQueue {
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
         drop(q);
+        sync_trace!("WaitQueue::sleep_timeout: park_timeout");
         thread::park_timeout(timeout);
         sync_trace!("WaitQueue::sleep_timeout: lock self.inner");
         let mut q = self.inner.lock().unwrap();
@@ -3135,7 +3150,7 @@ impl BlockCache {
             return Some(data);
         }
         let tick_before = CLK.load(Ordering::Relaxed);
-        if lat.as_nanos() > 0 { thread::sleep(lat); }
+        if lat.as_nanos() > 0 { sync_trace!("BlockCache::fetch: sleep (holding ch.lk)"); thread::sleep(lat); }
         let block_data = {
             let mut payload = Vec::with_capacity(512);
             let seed = k.wrapping_mul(0x9E3779B9) ^ tick_before;
@@ -3580,6 +3595,7 @@ impl FutexBucket {
         sync_trace!("FutexBucket::wait: lock self.waiters");
         { let mut w = self.waiters.lock().unwrap();
           w.push_back((addr, thread::current(), flag.clone())); }
+        sync_trace!("FutexBucket::wait: park");
         if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
         if flag.load(Ordering::Relaxed) {
             Ok(())
@@ -3642,6 +3658,7 @@ impl FutexTable {
         let mut wq = self.table.lock().unwrap();
         wq.push_back((addr, thread::current()));
         drop(wq);
+        sync_trace!("FutexTable::ftx_wait: park");
         thread::park();
         true
     }
