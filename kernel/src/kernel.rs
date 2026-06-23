@@ -269,7 +269,7 @@ impl KernLock {
         sync_trace!("GKL released");
         self.flag.store(false, Ordering::Release);
     }
-    pub fn held(&self) -> bool { sync_trace!("ENTER sync:held"); self.flag.load(Ordering::Relaxed) }
+    pub fn held(&self) -> bool { sync_trace!("ENTER sync:held"); let tid = thread::current().id(); *self.holder.lock().unwrap_or_else(|e| e.into_inner()) == Some(tid) }
     pub fn owner(&self) -> usize { sync_trace!("ENTER sync:owner"); self.dbg_tag.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { sync_trace!("ENTER sync:level"); self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, tag: usize) -> bool {
