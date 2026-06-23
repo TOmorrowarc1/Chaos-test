@@ -176,34 +176,13 @@ const TRACE_BUF_CAP: usize = 1000;
 macro_rules! sync_trace {
     ($($arg:tt)*) => {
         if SYNC_TRACE.load(Ordering::Relaxed) {
-            HOOK_INIT.call_once(|| {
-                std::panic::set_hook(Box::new(|info| {
-                    sync_trace_dump();
-                    println!("{}", info);
-                }));
-            });
-            let msg = format!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
-            if let Ok(mut buf) = TRACE_BUF.lock() {
-                if buf.len() >= TRACE_BUF_CAP { buf.pop_front(); }
-                buf.push_back(msg);
-            }
+            eprintln!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
         }
     };
 }
 
 pub fn sync_trace_dump() {
-    match TRACE_BUF.try_lock() {
-        Ok(buf) => {
-            println!("=== SYNC TRACE (last {}) ===", buf.len());
-            for entry in buf.iter() {
-                println!("{}", entry);
-            }
-            println!("=== END TRACE ===");
-        }
-        Err(_) => {
-            println!("=== SYNC TRACE: buffer locked, cannot dump ===");
-        }
-    }
+    eprintln!("=== SYNC TRACE: using eprintln mode, no buffer ===");
 }
 
 
