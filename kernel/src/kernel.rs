@@ -227,7 +227,7 @@ impl KernLock {
             dbg_tag: AtomicUsize::new(0),
         }
     }
-    pub fn enter(&self, tag: usize) { sync_trace!("ENTER sync:enter");
+    pub fn enter(&self, tag: usize) {
         let tid = thread::current().id();
         sync_trace!("GKL enter tag={}", tag);
         {
@@ -249,7 +249,7 @@ impl KernLock {
         self.dbg_tag.store(tag, Ordering::Relaxed);
         sync_trace!("GKL acquired tag={}", tag);
     }
-    pub fn leave(&self) { sync_trace!("ENTER sync:leave");
+    pub fn leave(&self) {
         /* hypothesis: the current thread is the holder of the lock, so we can skip checking the holder: 
         let tid = thread::current().id();
         {
@@ -272,7 +272,7 @@ impl KernLock {
     pub fn held(&self) -> bool { sync_trace!("ENTER sync:held"); self.flag.load(Ordering::Relaxed) }
     pub fn owner(&self) -> usize { sync_trace!("ENTER sync:owner"); self.dbg_tag.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { sync_trace!("ENTER sync:level"); self.depth.load(Ordering::Relaxed) }
-    pub fn try_enter(&self, tag: usize) -> bool { sync_trace!("ENTER sync:try_enter");
+    pub fn try_enter(&self, tag: usize) -> bool {
         let tid = thread::current().id();
         sync_trace!("GKL try_enter tag={}", tag);
         {
@@ -304,19 +304,19 @@ pub static GKL: KernLock = KernLock::new();
 pub struct Spin { v: AtomicBool }
 impl Spin {
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
-    pub fn acquire(&self) { sync_trace!("ENTER sync:acquire");
+    pub fn acquire(&self) {
         sync_trace!("spin acquire @{:#x}", self as *const Self as usize);
         while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
         sync_trace!("spin acquired @{:#x}", self as *const Self as usize);
     }
-    pub fn try_acquire(&self) -> bool { sync_trace!("ENTER sync:try_acquire");
+    pub fn try_acquire(&self) -> bool {
         let ok = self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
         sync_trace!("spin try_acquire @{:#x} -> {}", self as *const Self as usize, ok);
         ok
     }
-    pub fn release(&self) { sync_trace!("ENTER sync:release");
+    pub fn release(&self) {
         self.v.store(false, Ordering::Release);
         sync_trace!("spin release @{:#x}", self as *const Self as usize);
     }
