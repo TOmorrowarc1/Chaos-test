@@ -206,28 +206,26 @@ impl KernLock {
         }
     }
     pub fn enter(&self, tag: usize) {
-        let cur_tid = tid_as_u64();
-        let h = self.holder.load(Ordering::Relaxed);
-        let d = self.depth.load(Ordering::Relaxed);
-        let f = self.flag.load(Ordering::Relaxed);
-        sync_trace!("GKL enter tag={} holder={} depth={} flag={} cur_tid={}", tag, h, d, f, cur_tid);
-        if h == cur_tid && tag != 0 {
+        let tid = tid_as_u64();
+        sync_trace!("GKL enter tag={}", tag);
+        if self.holder.load(Ordering::Relaxed) == tid {
             self.depth.fetch_add(1, Ordering::Relaxed);
+            self.dbg_tag.store(tag, Ordering::Relaxed);
             sync_trace!("GKL reenter depth={}", self.depth.load(Ordering::Relaxed));
             return;
         }
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
-        self.holder.store(cur_tid, Ordering::Relaxed);
+        self.holder.store(tid, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
         self.dbg_tag.store(tag, Ordering::Relaxed);
         sync_trace!("GKL acquired tag={}", tag);
     }
     pub fn leave(&self) {
+        // let tid = tid_as_u64();
+        // if self.holder.load(Ordering::Relaxed) != tid { return; }
         let d = self.depth.load(Ordering::Relaxed);
-        let h = self.holder.load(Ordering::Relaxed);
-        sync_trace!("GKL leave holder={} depth={}", h, d);
         if d > 1 {
             self.depth.store(d - 1, Ordering::Relaxed);
             sync_trace!("GKL leave depth={}", d - 1);
@@ -235,7 +233,6 @@ impl KernLock {
         }
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
-        self.dbg_tag.store(0, Ordering::Relaxed);
         sync_trace!("GKL released");
         self.flag.store(false, Ordering::Release);
     }
@@ -243,16 +240,22 @@ impl KernLock {
     pub fn owner(&self) -> usize { self.dbg_tag.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, tag: usize) -> bool {
+        let tid = tid_as_u64();
         sync_trace!("GKL try_enter tag={}", tag);
-        if self.dbg_tag.load(Ordering::Relaxed) == tag && tag != 0 {
+        if self.holder.load(Ordering::Relaxed) == tid {
             self.depth.fetch_add(1, Ordering::Relaxed);
+            self.dbg_tag.store(tag, Ordering::Relaxed);
+            sync_trace!("GKL try_enter reenter depth={}", self.depth.load(Ordering::Relaxed));
             return true;
         }
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            self.dbg_tag.store(tag, Ordering::Relaxed);
+            self.holder.store(tid, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
+            self.dbg_tag.store(tag, Ordering::Relaxed);
+            sync_trace!("GKL try_enter acquired tag={}", tag);
             true
         } else {
+            sync_trace!("GKL try_enter failed tag={}", tag);
             false
         }
     }
