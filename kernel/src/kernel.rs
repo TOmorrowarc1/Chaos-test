@@ -345,8 +345,8 @@ pub type EvCb = Box<dyn Fn(u32) -> bool + Send>;
 
 #[derive(Default)]
 pub struct EvBus {
-    ev: u32,
-    cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,
+    pub ev: u32,
+    pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,
 }
 impl EvBus {
     pub fn make() -> Arc<Mutex<Self>> { Arc::new(Mutex::new(Self::default())) }
@@ -370,9 +370,9 @@ pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
 }
 
 pub struct RegEp {
-    task_id: usize,
-    epfd: usize,
-    fd: usize,
+    pub task_id: usize,
+    pub epfd: usize,
+    pub fd: usize,
 }
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
@@ -568,11 +568,11 @@ impl<'a> Deref for SemaGuard<'a> {
     fn deref(&self) -> &Self::Target { self.s }
 }
 pub struct CircBuf {
-    data: Vec<u8>,
-    rd: usize,
-    wr: usize,
-    cap: usize,
-    n: usize,
+    pub data: Vec<u8>,
+    pub rd: usize,
+    pub wr: usize,
+    pub cap: usize,
+    pub n: usize,
 }
 impl CircBuf {
     pub fn new(c: usize) -> Self { Self { data: vec![0u8; c], rd: 0, wr: 0, cap: c, n: 0 } }
@@ -631,10 +631,10 @@ impl CircBuf {
     pub fn remaining(&self) -> usize { self.cap.saturating_sub(self.n) }
 }
 pub struct Channel {
-    buf: Mutex<CircBuf>,
-    guard: Spin,
-    wq: SyncQueue,
-    shut: AtomicBool,
+    pub buf: Mutex<CircBuf>,
+    pub guard: Spin,
+    pub wq: SyncQueue,
+    pub shut: AtomicBool,
 }
 impl Channel {
     pub fn new(cap: usize) -> Self {
@@ -736,8 +736,8 @@ impl Channel {
     }
 }
 pub struct WaitQueue {
-    inner: Mutex<VecDeque<(usize, thread::Thread, u32)>>,
-    wake_count: AtomicUsize,
+    pub inner: Mutex<VecDeque<(usize, thread::Thread, u32)>>,
+    pub wake_count: AtomicUsize,
 }
 
 impl WaitQueue {
@@ -955,12 +955,12 @@ impl PgFrame {
 }
 
 pub struct VmRegion {
-    base: usize,
-    len: usize,
-    flags: u32,
-    offset: usize,
-    tag: u16,
-    ref_count: AtomicUsize,
+    pub base: usize,
+    pub len: usize,
+    pub flags: u32,
+    pub offset: usize,
+    pub tag: u16,
+    pub ref_count: AtomicUsize,
 }
 impl VmRegion {
     pub fn new(base: usize, len: usize, flags: u32) -> Self {
@@ -1020,9 +1020,9 @@ impl VmRegion {
     pub fn ref_get(&self) -> usize { self.ref_count.load(Ordering::Relaxed) }
 }
 pub struct VmMap {
-    regions: Vec<VmRegion>,
-    brk: usize,
-    mmap_base: usize,
+    pub regions: Vec<VmRegion>,
+    pub brk: usize,
+    pub mmap_base: usize,
 }
 
 impl VmMap {
@@ -1162,13 +1162,13 @@ impl VmMap {
 }
 
 pub struct ZoneInfo {
-    zone_id: usize,
-    base_pfn: usize,
-    page_count: usize,
-    free_count: AtomicUsize,
-    low_watermark: usize,
-    high_watermark: usize,
-    managed: AtomicBool,
+    pub zone_id: usize,
+    pub base_pfn: usize,
+    pub page_count: usize,
+    pub free_count: AtomicUsize,
+    pub low_watermark: usize,
+    pub high_watermark: usize,
+    pub managed: AtomicBool,
 }
 impl ZoneInfo {
     pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
@@ -1365,9 +1365,9 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
 }
 
 pub struct SharedPage {
-    frame: AtomicUsize,
-    w: AtomicBool,
-    pending: AtomicBool,
+    pub frame: AtomicUsize,
+    pub w: AtomicBool,
+    pub pending: AtomicBool,
 }
 impl SharedPage {
     pub fn new(f: usize) -> Self {
@@ -1407,11 +1407,11 @@ impl SharedPage {
     }
 }
 pub struct AddrSpace {
-    vm_map: VmMap,
-    page_table_root: usize,
-    asid: u16,
-    ref_count: AtomicUsize,
-    cow_pages: Mutex<BTreeMap<usize, PgFrame>>,
+    pub vm_map: VmMap,
+    pub page_table_root: usize,
+    pub asid: u16,
+    pub ref_count: AtomicUsize,
+    pub cow_pages: Mutex<BTreeMap<usize, PgFrame>>,
 }
 
 impl AddrSpace {
@@ -1531,11 +1531,11 @@ impl AddrSpace {
 }
 
 pub struct BuddyAllocator {
-    free_lists: Vec<Vec<usize>>,
-    max_order: usize,
-    base_addr: usize,
-    total_pages: usize,
-    allocated: AtomicUsize,
+    pub free_lists: Vec<Vec<usize>>,
+    pub max_order: usize,
+    pub base_addr: usize,
+    pub total_pages: usize,
+    pub allocated: AtomicUsize,
 }
 
 impl BuddyAllocator {
@@ -1643,12 +1643,12 @@ impl BuddyAllocator {
     }
 }
 pub struct SlabEntry {
-    data: Vec<u8>,
-    obj_size: usize,
-    capacity: usize,
-    free_list: VecDeque<usize>,
-    allocated: usize,
-    tag: u32,
+    pub data: Vec<u8>,
+    pub obj_size: usize,
+    pub capacity: usize,
+    pub free_list: VecDeque<usize>,
+    pub allocated: usize,
+    pub tag: u32,
 }
 impl SlabEntry {
     pub fn new(obj_size: usize, capacity: usize) -> Self {
@@ -1874,25 +1874,25 @@ pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
 }
 
 pub struct TimerEntry {
-    deadline: usize,
-    interval: usize,
-    callback_id: usize,
-    active: bool,
-    repeat: bool,
+    pub deadline: usize,
+    pub interval: usize,
+    pub callback_id: usize,
+    pub active: bool,
+    pub repeat: bool,
 }
 pub struct IoRequest {
-    block: usize,
-    write: bool,
-    priority: u8,
-    submitted_tick: usize,
+    pub block: usize,
+    pub write: bool,
+    pub priority: u8,
+    pub submitted_tick: usize,
 }
 
 pub struct IoQueue {
-    pending: Mutex<VecDeque<IoRequest>>,
-    head_pos: AtomicUsize,
-    direction_up: AtomicBool,
-    dispatched: AtomicUsize,
-    merged: AtomicUsize,
+    pub pending: Mutex<VecDeque<IoRequest>>,
+    pub head_pos: AtomicUsize,
+    pub direction_up: AtomicBool,
+    pub dispatched: AtomicUsize,
+    pub merged: AtomicUsize,
 }
 
 impl IoQueue {
@@ -1997,10 +1997,10 @@ impl IoQueue {
 }
 
 pub struct Disk {
-    errs: AtomicUsize,
-    ops: AtomicUsize,
-    label: String,
-    journal: Option<Arc<Disk>>,
+    pub errs: AtomicUsize,
+    pub ops: AtomicUsize,
+    pub label: String,
+    pub journal: Option<Arc<Disk>>,
 }
 impl Disk {
     pub fn new(s: &str) -> Self {
@@ -2103,8 +2103,8 @@ impl TimerEntry {
 }
 
 pub struct TimerWheel {
-    slots: Vec<Vec<TimerEntry>>,
-    current_slot: usize,
+    pub slots: Vec<Vec<TimerEntry>>,
+    pub current_slot: usize,
 }
 
 impl TimerWheel {
@@ -2259,15 +2259,15 @@ pub fn compute_inet_checksum(data: &[u8]) -> u16 {
 
 
 pub struct SigAction {
-    handler: usize,
-    flags: u32,
-    mask: u64,
+    pub handler: usize,
+    pub flags: u32,
+    pub mask: u64,
 }
 
 pub struct SigSet {
-    pending: u64,
-    blocked: u64,
-    actions: Vec<SigAction>,
+    pub pending: u64,
+    pub blocked: u64,
+    pub actions: Vec<SigAction>,
 }
 impl SigSet {
     pub fn new() -> Self {
@@ -2363,10 +2363,10 @@ impl SigSet {
 
 #[derive(Debug, Clone, Copy)]
 pub struct FdOpt {
-    rd: bool,
-    wr: bool,
-    ap: bool,
-    nb: bool,
+    pub rd: bool,
+    pub wr: bool,
+    pub ap: bool,
+    pub nb: bool,
 }
 impl Default for FdOpt {
     fn default() -> Self { Self { rd: true, wr: false, ap: false, nb: false } }
@@ -2380,11 +2380,11 @@ impl FdState {
 
 #[derive(Clone)]
 pub struct FHandle {
-    path: String,
-    data: Arc<Mutex<Vec<u8>>>,
+    pub path: String,
+    pub data: Arc<Mutex<Vec<u8>>>,
     desc: Arc<RwLock<FdState>>,
-    pipe: bool,
-    cloexec: bool,
+    pub pipe: bool,
+    pub cloexec: bool,
 }
 
 #[derive(Debug)]
@@ -2580,9 +2580,9 @@ impl fmt::Debug for FHandle {
 pub enum PipeDir { Rd, Wr }
 
 pub struct PipeBuf {
-    buf: VecDeque<u8>,
-    bus: EvBus,
-    ends: i32,
+    pub buf: VecDeque<u8>,
+    pub bus: EvBus,
+    pub ends: i32,
 }
 
 #[derive(Clone)]
@@ -2677,9 +2677,9 @@ impl EpCtlOp {
 
 #[derive(Clone)]
 pub struct EpInst {
-    events: BTreeMap<usize, EpEvent>,
-    ready: Arc<Mutex<BTreeSet<usize>>>,
-    new_ctl: Arc<Mutex<BTreeSet<usize>>>,
+    pub events: BTreeMap<usize, EpEvent>,
+    pub ready: Arc<Mutex<BTreeSet<usize>>>,
+    pub new_ctl: Arc<Mutex<BTreeSet<usize>>>,
 }
 impl EpInst {
     pub fn new() -> Self {
@@ -2936,14 +2936,14 @@ pub fn read_as_vec(data: &[u8]) -> Vec<u8> { data.to_vec() }
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TrmIO {
-    iflag: u32,
-    oflag: u32,
-    cflag: u32,
-    lflag: u32,
-    line: u8,
-    cc: [u8; 32],
-    ispeed: u32,
-    ospeed: u32,
+    pub iflag: u32,
+    pub oflag: u32,
+    pub cflag: u32,
+    pub lflag: u32,
+    pub line: u8,
+    pub cc: [u8; 32],
+    pub ispeed: u32,
+    pub ospeed: u32,
 }
 impl Default for TrmIO {
     fn default() -> Self {
@@ -2965,20 +2965,20 @@ impl Default for TrmIO {
 pub struct WinSz { pub row: u16, pub col: u16, pub xpx: u16, pub ypx: u16 }
 
 pub struct PageCacheEntry {
-    page_id: usize,
-    data: Vec<u8>,
-    dirty: bool,
-    access_tick: usize,
-    pin_count: usize,
+    pub page_id: usize,
+    pub data: Vec<u8>,
+    pub dirty: bool,
+    pub access_tick: usize,
+    pub pin_count: usize,
 }
 
 pub struct PageCache {
-    entries: HashMap<usize, PageCacheEntry>,
-    capacity: usize,
-    hits: AtomicUsize,
-    misses: AtomicUsize,
-    evictions: AtomicUsize,
-    lru_order: VecDeque<usize>,
+    pub entries: HashMap<usize, PageCacheEntry>,
+    pub capacity: usize,
+    pub hits: AtomicUsize,
+    pub misses: AtomicUsize,
+    pub evictions: AtomicUsize,
+    pub lru_order: VecDeque<usize>,
 }
 
 impl PageCache {
@@ -3396,18 +3396,18 @@ impl MountTable {
 }
 
 pub struct KObjEntry {
-    obj_id: usize,
-    type_tag: u32,
-    owner_pid: usize,
-    created_tick: usize,
-    ref_count: usize,
-    parent_id: Option<usize>,
+    pub obj_id: usize,
+    pub type_tag: u32,
+    pub owner_pid: usize,
+    pub created_tick: usize,
+    pub ref_count: usize,
+    pub parent_id: Option<usize>,
 }
 
 pub struct KObjRegistry {
-    objects: Mutex<BTreeMap<usize, KObjEntry>>,
-    seq: AtomicUsize,
-    type_index: Mutex<BTreeMap<u32, Vec<usize>>>,
+    pub objects: Mutex<BTreeMap<usize, KObjEntry>>,
+    pub seq: AtomicUsize,
+    pub type_index: Mutex<BTreeMap<u32, Vec<usize>>>,
 }
 
 impl KObjRegistry {
@@ -3716,29 +3716,29 @@ type SemOp = i16;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IpcPerm {
-    key: u32,
-    uid: u32,
-    gid: u32,
-    cuid: u32,
-    cgid: u32,
-    mode: u32,
-    seq: u32,
-    pad1: usize,
-    pad2: usize,
+    pub key: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub cuid: u32,
+    pub cgid: u32,
+    pub mode: u32,
+    pub seq: u32,
+    pub pad1: usize,
+    pub pad2: usize,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SemDs {
-    perm: IpcPerm,
-    otime: usize,
+    pub perm: IpcPerm,
+    pub otime: usize,
     _p1: usize,
-    ctime: usize,
+    pub ctime: usize,
     _p2: usize,
-    nsems: usize,
+    pub nsems: usize,
 }
 pub struct SemArr {
-    ds: Mutex<SemDs>,
-    sems: Vec<Sema>,
+    pub ds: Mutex<SemDs>,
+    pub sems: Vec<Sema>,
 }
 impl Index<usize> for SemArr {
     type Output = Sema;
@@ -3790,8 +3790,8 @@ impl SemArr {
 }
 #[derive(Default)]
 pub struct SemCtx {
-    arrays: BTreeMap<SemId, Arc<SemArr>>,
-    undos: BTreeMap<(SemId, SemNum), SemOp>,
+    pub arrays: BTreeMap<SemId, Arc<SemArr>>,
+    pub undos: BTreeMap<(SemId, SemNum), SemOp>,
 }
 impl SemCtx {
     pub fn add(&mut self, arr: Arc<SemArr>) -> SemId {
@@ -3830,8 +3830,8 @@ impl Drop for SemCtx {
 type ShmId = usize;
 #[derive(Clone)]
 pub struct ShmTag {
-    addr: usize,
-    pages: Arc<Mutex<Vec<usize>>>,
+    pub addr: usize,
+    pub pages: Arc<Mutex<Vec<usize>>>,
 }
 impl ShmTag {
     pub fn set_addr(&mut self, a: usize) { self.addr = a; }
@@ -3871,9 +3871,9 @@ impl Clone for ShmCtx {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
-    r: [u64; N_REGS],
-    ip: u64,
-    flags: u64,
+    pub r: [u64; N_REGS],
+    pub ip: u64,
+    pub flags: u64,
 }
 impl Context {
     pub fn new() -> Self { Self { r: [0u64; N_REGS], ip: 0, flags: 0 } }
@@ -4013,14 +4013,14 @@ impl Context {
 }
 
 pub struct TrapCtl {
-    active: AtomicBool,
-    hw_mask: AtomicU32,
-    sw_mask: AtomicU32,
-    nest: AtomicUsize,
-    frame: Mutex<Option<Context>>,
-    stack: Mutex<Vec<Context>>,
-    irq_on: AtomicBool,
-    suppressed: AtomicBool,
+    pub active: AtomicBool,
+    pub hw_mask: AtomicU32,
+    pub sw_mask: AtomicU32,
+    pub nest: AtomicUsize,
+    pub frame: Mutex<Option<Context>>,
+    pub stack: Mutex<Vec<Context>>,
+    pub irq_on: AtomicBool,
+    pub suppressed: AtomicBool,
 }
 impl TrapCtl {
     pub fn new() -> Self {
@@ -4208,7 +4208,7 @@ pub fn ser(c: u8) -> u8 { if c == b'\r' { b'\n' } else { c } }
 pub type Tid = usize;
 pub type Pgid = i32;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Pid(usize);
+pub struct Pid(pub usize);
 impl Pid {
     pub const INIT: usize = 1;
     pub fn new() -> Self { Pid(0) }
@@ -4220,15 +4220,15 @@ impl fmt::Display for Pid {
 }
 #[derive(Clone, Debug)]
 pub struct TaskInfo {
-    id: usize,
-    tag: String,
-    status: Option<i32>,
-    fds: Vec<String>,
+    pub id: usize,
+    pub tag: String,
+    pub status: Option<i32>,
+    pub fds: Vec<String>,
 }
 pub struct ThdCtx {
-    uctx: Context,
-    clear_tid: usize,
-    smask: u64,
+    pub uctx: Context,
+    pub clear_tid: usize,
+    pub smask: u64,
 }
 impl Default for ThdCtx {
     fn default() -> Self {
@@ -4237,9 +4237,9 @@ impl Default for ThdCtx {
 }
 
 pub struct CapSet {
-    bits: u64,
-    effective: u64,
-    ambient: u64,
+    pub bits: u64,
+    pub effective: u64,
+    pub ambient: u64,
 }
 impl CapSet {
     pub fn new() -> Self { Self { bits: 0, effective: 0, ambient: 0 } }
@@ -4304,11 +4304,11 @@ impl CapSet {
 
 #[derive(Clone, Copy)]
 pub struct SchedulePolicy {
-    policy: u8,
-    prio: i32,
-    nice: i32,
-    time_slice: usize,
-    vruntime: u64,
+    pub policy: u8,
+    pub prio: i32,
+    pub nice: i32,
+    pub time_slice: usize,
+    pub vruntime: u64,
 }
 
 impl SchedulePolicy {
@@ -4332,9 +4332,9 @@ impl SchedulePolicy {
     }
 }
 pub struct RunQueue {
-    queue: Mutex<Vec<(usize, SchedulePolicy)>>,
-    current: Mutex<Option<(usize, SchedulePolicy)>>,
-    preempt_count: AtomicUsize,
+    pub queue: Mutex<Vec<(usize, SchedulePolicy)>>,
+    pub current: Mutex<Option<(usize, SchedulePolicy)>>,
+    pub preempt_count: AtomicUsize,
 }
 
 impl RunQueue {
@@ -4514,26 +4514,26 @@ impl RunQueue {
 }
 
 pub struct Task {
-    info: Mutex<TaskInfo>,
-    parent: Mutex<Option<Arc<Task>>>,
-    subtasks: Mutex<Vec<Arc<Task>>>,
-    files: Mutex<BTreeMap<usize, FLike>>,
-    cwd: Mutex<String>,
-    exec_path: Mutex<String>,
-    futexes: Mutex<BTreeMap<usize, Arc<FutexBucket>>>,
-    sem_ctx: Mutex<SemCtx>,
-    shm_ctx: Mutex<ShmCtx>,
-    pid: Mutex<Pid>,
-    pgid: Mutex<Pgid>,
-    threads: Mutex<Vec<Tid>>,
-    ev: Arc<Mutex<EvBus>>,
-    exit_code: Mutex<usize>,
-    sig_queue: Mutex<VecDeque<(i32, isize)>>,
-    sig_mask: Mutex<u64>,
-    ep_inst: Mutex<BTreeMap<usize, EpInst>>,
-    kstk: Mutex<Option<KStk>>,
-    thd_ctx: Mutex<Option<ThdCtx>>,
-    vm_token: AtomicUsize,
+    pub info: Mutex<TaskInfo>,
+    pub parent: Mutex<Option<Arc<Task>>>,
+    pub subtasks: Mutex<Vec<Arc<Task>>>,
+    pub files: Mutex<BTreeMap<usize, FLike>>,
+    pub cwd: Mutex<String>,
+    pub exec_path: Mutex<String>,
+    pub futexes: Mutex<BTreeMap<usize, Arc<FutexBucket>>>,
+    pub sem_ctx: Mutex<SemCtx>,
+    pub shm_ctx: Mutex<ShmCtx>,
+    pub pid: Mutex<Pid>,
+    pub pgid: Mutex<Pgid>,
+    pub threads: Mutex<Vec<Tid>>,
+    pub ev: Arc<Mutex<EvBus>>,
+    pub exit_code: Mutex<usize>,
+    pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
+    pub sig_mask: Mutex<u64>,
+    pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
+    pub kstk: Mutex<Option<KStk>>,
+    pub thd_ctx: Mutex<Option<ThdCtx>>,
+    pub vm_token: AtomicUsize,
 }
 
 impl Task {
@@ -4802,9 +4802,9 @@ impl fmt::Debug for Task {
 }
 
 pub struct TaskTable {
-    map: RwLock<BTreeMap<usize, Arc<Task>>>,
-    seq: AtomicUsize,
-    root: Mutex<Option<Arc<Task>>>,
+    pub map: RwLock<BTreeMap<usize, Arc<Task>>>,
+    pub seq: AtomicUsize,
+    pub root: Mutex<Option<Arc<Task>>>,
 }
 impl TaskTable {
     pub fn new() -> Self {
@@ -5045,11 +5045,11 @@ impl TaskTable {
 }
 
 pub struct ProcessGroup {
-    pgid: Pgid,
-    leader: usize,
-    members: Mutex<Vec<usize>>,
-    session_id: usize,
-    foreground: AtomicBool,
+    pub pgid: Pgid,
+    pub leader: usize,
+    pub members: Mutex<Vec<usize>>,
+    pub session_id: usize,
+    pub foreground: AtomicBool,
 }
 
 impl ProcessGroup {
@@ -5116,13 +5116,13 @@ impl ProcessGroup {
 }
 
 pub struct ResourceLimits {
-    max_fds: usize,
-    max_threads: usize,
-    max_stack_size: usize,
-    max_data_size: usize,
-    max_file_size: usize,
-    max_mappings: usize,
-    cpu_time_limit: usize,
+    pub max_fds: usize,
+    pub max_threads: usize,
+    pub max_stack_size: usize,
+    pub max_data_size: usize,
+    pub max_file_size: usize,
+    pub max_mappings: usize,
+    pub cpu_time_limit: usize,
 }
 
 impl ResourceLimits {
@@ -5236,9 +5236,9 @@ pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
     Ok(e_entry)
 }
 pub struct ProcInit {
-    args: Vec<String>,
-    envs: Vec<String>,
-    auxv: BTreeMap<u8, usize>,
+    pub args: Vec<String>,
+    pub envs: Vec<String>,
+    pub auxv: BTreeMap<u8, usize>,
 }
 impl ProcInit {
     pub fn push_at(&self, top: usize) -> usize {
@@ -5310,18 +5310,18 @@ pub fn compute_load_balance(task_counts: &[usize], priorities: &[i32], io_blocke
         .sum();
     candidates[0]
 }
-pub fn yield_now_sync() { thread::yield_now(); }
+pub fn yield_now_sync() { sync_trace!("yield_now_sync"); thread::yield_now(); }
 
 pub struct Kernel {
-    tasks: TaskTable,
-    cache: BlockCache,
-    pool: FramePool,
-    disk: Disk,
-    cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
-    mnt: MountTable,
-    sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
-    shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
-    tty_buf: Mutex<VecDeque<u8>>,
+    pub tasks: TaskTable,
+    pub cache: BlockCache,
+    pub pool: FramePool,
+    pub disk: Disk,
+    pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
+    pub mnt: MountTable,
+    pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
+    pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
+    pub tty_buf: Mutex<VecDeque<u8>>,
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
@@ -5433,10 +5433,12 @@ impl Kernel {
     pub fn spawn_thread(&self, task: Arc<Task>) -> thread::JoinHandle<()> {
         let token = task.vm_token.load(Ordering::Relaxed);
         thread::spawn(move || {
+            let dbg_id = task.id();
             loop {
                 let mut tc = task.begin_run();
                 task.end_run(tc);
                 if task.done() { break; }
+                sync_trace!("spawn_thread: yield_now (waiting task.done) id={}", dbg_id);
                 thread::yield_now();
             }
         })
