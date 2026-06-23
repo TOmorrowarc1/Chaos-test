@@ -2014,12 +2014,17 @@ impl Disk {
     pub fn read_block(&self, blk: usize, out: &mut [u8]) -> Result<(), &'static str> {
         let sector = blk;
         let buf_len = out.len();
+        let mut spins = 0usize;
         loop {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
                 out.fill(0xAA);
                 return Ok(());
+            }
+            spins += 1;
+            if spins == 1 || spins % 100_000 == 0 {
+                sync_trace!("Disk::read_block: spinning blk={} errs={:#x} spins={}", blk, rem, spins);
             }
             let persistent = rem == usize::MAX;
             if !persistent {
@@ -2047,6 +2052,9 @@ impl Disk {
             if rem == 0 {
                 for (i, b) in out.iter_mut().enumerate() { *b = 0xAA ^ (i as u8); }
                 return Ok(attempt);
+            }
+            if attempt == 1 || attempt % 100_000 == 0 {
+                sync_trace!("Disk::read_block_n: spinning blk={} errs={:#x} attempt={} lim={}", blk, rem, attempt, lim);
             }
             if rem != usize::MAX { self.errs.fetch_sub(1, Ordering::SeqCst); }
             if let Some(ref jd) = self.journal {
