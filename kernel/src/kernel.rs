@@ -176,23 +176,40 @@ const TRACE_BUF_CAP: usize = 1000;
 macro_rules! sync_trace {
     ($($arg:tt)*) => {
         if SYNC_TRACE.load(Ordering::Relaxed) {
-            eprintln!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
+            HOOK_INIT.call_once(|| {
+                std::panic::set_hook(Box::new(|info| {
+                    sync_trace_dump();
+                    println!("{}", info);
+                }));
+            });
+            let msg = format!("[SYNC] t={:?} {}", std::thread::current().id(), format!($($arg)*));
+            if let Ok(mut buf) = TRACE_BUF.lock() {
+                if buf.len() >= TRACE_BUF_CAP { buf.pop_front(); }
+                buf.push_back(msg);
+            }
         }
     };
 }
 
 pub fn sync_trace_dump() {
-    eprintln!("=== SYNC TRACE: using eprintln mode, no buffer ===");
+    match TRACE_BUF.try_lock() {
+        Ok(buf) => {
+            println!("=== SYNC TRACE (last {}) ===", buf.len());
+            for entry in buf.iter() {
+                println!("{}", entry);
+            }
+            println!("=== END TRACE ===");
+        }
+        Err(_) => {
+            println!("=== SYNC TRACE: buffer locked, cannot dump ===");
+        }
+    }
 }
 
-
-fn tid_as_u64() -> u64 {
-    unsafe { std::mem::transmute(thread::current().id()) }
-}
 
 pub struct KernLock {
     flag: AtomicBool,
-    holder: AtomicU64,
+    holder: Mutex<Option<thread::ThreadId>>,
     depth: AtomicUsize,
     dbg_tag: AtomicUsize,
 }
@@ -200,38 +217,49 @@ impl KernLock {
     pub const fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
-            holder: AtomicU64::new(0),
+            holder: Mutex::new(None),
             depth: AtomicUsize::new(0),
             dbg_tag: AtomicUsize::new(0),
         }
     }
     pub fn enter(&self, tag: usize) {
-        let tid = tid_as_u64();
+        let tid = thread::current().id();
         sync_trace!("GKL enter tag={}", tag);
-        if self.holder.load(Ordering::Relaxed) == tid {
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            self.dbg_tag.store(tag, Ordering::Relaxed);
-            sync_trace!("GKL reenter depth={}", self.depth.load(Ordering::Relaxed));
-            return;
+        {
+            sync_trace!("KernLock::enter: lock self.holder");
+            let mut h = self.holder.lock().unwrap();
+            if *h == Some(tid) {
+                self.depth.fetch_add(1, Ordering::Relaxed);
+                self.dbg_tag.store(tag, Ordering::Relaxed);
+                sync_trace!("GKL reenter depth={}", self.depth.load(Ordering::Relaxed));
+                return;
+            }
         }
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
-        self.holder.store(tid, Ordering::Relaxed);
+        sync_trace!("KernLock::enter: lock self.holder");
+        *self.holder.lock().unwrap() = Some(tid);
         self.depth.store(1, Ordering::Relaxed);
         self.dbg_tag.store(tag, Ordering::Relaxed);
         sync_trace!("GKL acquired tag={}", tag);
     }
     pub fn leave(&self) {
-        // let tid = tid_as_u64();
-        // if self.holder.load(Ordering::Relaxed) != tid { return; }
+        /* hypothesis: the current thread is the holder of the lock, so we can skip checking the holder: 
+        let tid = thread::current().id();
+        {
+            sync_trace!("KernLock::leave: lock self.holder");
+            let h = self.holder.lock().unwrap();
+            if *h != Some(tid) { return; }
+        }*/
         let d = self.depth.load(Ordering::Relaxed);
         if d > 1 {
             self.depth.store(d - 1, Ordering::Relaxed);
             sync_trace!("GKL leave depth={}", d - 1);
             return;
         }
-        self.holder.store(0, Ordering::Relaxed);
+        sync_trace!("KernLock::leave: lock self.holder");
+        *self.holder.lock().unwrap() = None;
         self.depth.store(0, Ordering::Relaxed);
         sync_trace!("GKL released");
         self.flag.store(false, Ordering::Release);
@@ -240,16 +268,21 @@ impl KernLock {
     pub fn owner(&self) -> usize { self.dbg_tag.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, tag: usize) -> bool {
-        let tid = tid_as_u64();
+        let tid = thread::current().id();
         sync_trace!("GKL try_enter tag={}", tag);
-        if self.holder.load(Ordering::Relaxed) == tid {
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            self.dbg_tag.store(tag, Ordering::Relaxed);
-            sync_trace!("GKL try_enter reenter depth={}", self.depth.load(Ordering::Relaxed));
-            return true;
+        {
+            sync_trace!("KernLock::try_enter: lock self.holder");
+            let mut h = self.holder.lock().unwrap();
+            if *h == Some(tid) {
+                self.depth.fetch_add(1, Ordering::Relaxed);
+                self.dbg_tag.store(tag, Ordering::Relaxed);
+                sync_trace!("GKL try_enter reenter depth={}", self.depth.load(Ordering::Relaxed));
+                return true;
+            }
         }
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            self.holder.store(tid, Ordering::Relaxed);
+            sync_trace!("KernLock::try_enter: lock self.holder");
+            *self.holder.lock().unwrap() = Some(tid);
             self.depth.store(1, Ordering::Relaxed);
             self.dbg_tag.store(tag, Ordering::Relaxed);
             sync_trace!("GKL try_enter acquired tag={}", tag);
