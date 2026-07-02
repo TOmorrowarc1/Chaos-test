@@ -269,7 +269,7 @@ impl KernLock {
         sync_trace!("GKL released");
         self.flag.store(false, Ordering::Release);
     }
-    pub fn held(&self) -> bool { sync_trace!("ENTER sync:held"); let tid = thread::current().id(); *self.holder.lock().unwrap_or_else(|e| e.into_inner()) == Some(tid) }
+    pub fn held(&self) -> bool { sync_trace!("ENTER sync:held"); self.flag.load(Ordering::Relaxed) }
     pub fn owner(&self) -> usize { sync_trace!("ENTER sync:owner"); self.dbg_tag.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { sync_trace!("ENTER sync:level"); self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, tag: usize) -> bool {
@@ -444,6 +444,8 @@ impl SyncQueue {
         q.push_back(thread::current());
     }
     pub fn pending(&self) -> usize { sync_trace!("ENTER sync:pending"); sync_trace!("SyncQueue::pending: lock self.q"); let q = self.q.lock().unwrap(); q.len() }
+    //!! Seems buggy since there is a race window, but what does it do when having park_on??
+    // Maybe it should contain a park_on in the loop.
     pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool { sync_trace!("ENTER sync:wait_ev");
         loop {
             sync_trace!("SyncQueue::wait_ev: lock g");
@@ -487,6 +489,7 @@ impl SyncQueue {
         thread::park_timeout(timeout);
         true
     }
+    // A bit hacking but I am not able to rewrite a refactor around epoll for this.
     pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) { sync_trace!("ENTER sync:reg_epoll");
         sync_trace!("SyncQueue::reg_epoll: lock self.eq");
         self.eq.lock().unwrap().push_back(RegEp { task_id, epfd, fd });
@@ -567,6 +570,7 @@ impl<'a> Deref for SemaGuard<'a> {
     type Target = Sema;
     fn deref(&self) -> &Self::Target { sync_trace!("ENTER sync:deref"); self.s }
 }
+
 pub struct CircBuf {
     pub data: Vec<u8>,
     pub rd: usize,
@@ -646,36 +650,35 @@ impl Channel {
             shut: AtomicBool::new(false),
         }
     }
+    /// Blocking receive.  Returns `Some(byte)` if data is available, or
+    /// `None` if the channel has been shut and the buffer is empty.
+    ///
+    /// Uses `park_on` (via SyncQueue) to wait on the buffer's mutex with
+    /// the predicate `!ring.empty()`.  This consumes the `pending` lost‑
+    /// wakeup flag, so a `send().signal()` that races with the
+    /// unlock→enqueue window is correctly captured.
+    ///
+    /// NOTE: the `close().broadcast()` race is still present — `broadcast`
+    /// does NOT set `pending`, so a close between the guard‑release and
+    /// `park_on`'s enqueue can still lose the wakeup.  That is a known
+    /// limitation inherited from the original `enqueue_self`+`park` design.
     pub fn recv(&self) -> Option<u8> { sync_trace!("ENTER sync:recv");
-        self.guard.acquire();
-        sync_trace!("Channel::recv: lock self.buf");
-        let result = self.buf.lock().unwrap().pop();
-        if result.is_some() {
-            self.guard.release();
-            return result;
-        }
-        if self.shut.load(Ordering::Relaxed) {
-            self.guard.release();
-            return None;
-        }
-        {
+        loop {
+            self.guard.acquire();
             sync_trace!("Channel::recv: lock self.buf");
-            let ring = self.buf.lock().unwrap();
-            if !ring.empty() {
-                drop(ring);
-            } else {
-                drop(ring);
-                self.wq.enqueue_self();
+            let result = self.buf.lock().unwrap().pop();
+            if result.is_some() {
                 self.guard.release();
-                sync_trace!("Channel::recv: park");
-                thread::park();
-                self.guard.acquire();
+                return result;
             }
+            if self.shut.load(Ordering::Relaxed) {
+                self.guard.release();
+                return None;
+            }
+            self.guard.release();
+            sync_trace!("Channel::recv: park_on self.buf");
+            self.wq.park_on(&self.buf, |ring| !ring.empty());
         }
-        sync_trace!("Channel::recv: lock self.buf");
-        let v = self.buf.lock().unwrap().pop();
-        self.guard.release();
-        v
     }
     pub fn send(&self, v: u8) -> bool { sync_trace!("ENTER sync:send");
         sync_trace!("Channel::send: lock self.buf");
@@ -2369,6 +2372,15 @@ impl SigSet {
 }
 
 
+/// FdOpt captures the *persistent* file‑descriptor state that must
+/// travel with the fd for its entire lifetime:
+///
+///   rd/wr  – access privilege; checked on every read/write
+///   ap     – append mode (O_APPEND): forces all writes to EOF
+///   nb     – non‑blocking mode (O_NONBLOCK): I/O never blocks
+///
+/// Creation‑time flags (O_CREAT, O_EXCL, O_TRUNC, O_CLOEXEC)
+/// affect the *open* operation only and are NOT stored here.
 #[derive(Debug, Clone, Copy)]
 pub struct FdOpt {
     pub rd: bool,
@@ -2379,6 +2391,28 @@ pub struct FdOpt {
 impl Default for FdOpt {
     fn default() -> Self { sync_trace!("ENTER fs:default"); Self { rd: true, wr: false, ap: false, nb: false } }
 }
+
+/// FdState is the per‑open‑file‑description state.  It is wrapped in an
+/// `Arc<RwLock<…>>` inside `FHandle`, so `dup()` / `fork()` share the same
+/// `FdState` via `Arc::clone`.  Fields:
+///
+///   off  – current seek offset of this descriptor (NOTE: sharing via dup
+///          means duplicated fds share a cursor — not POSIX‑conforming)
+///   opt  – open‑mode flags (rd/wr/ap/nb); checked on every I/O operation
+///   flk  – placeholder for BSD‑style advisory locks (flock(2)).
+///
+/// BSD lock semantics:
+///   ─ The advisory lock lives on the *open file description* (here: FdState), not
+///     on the inode.  All fds that refer to the same description (via dup,
+///     fork, F_DUPFD) share the same lock state.
+///   ─ The lock is released when the *last* fd referencing this description
+///     is closed (i.e. when the Arc ref‑count drops to zero).
+///   ─ Independent open(2) calls to the same path create *separate* open
+///     file descriptions — they get independent locks and cannot coordinate
+///     via flock().  
+///   ─ For cross‑process inode‑level coordination, fcntl(2)
+///     advisory locks (F_SETLK / F_GETLK) should live on the inode instead.
+/// If forget, man 2 flock()/fcntl() for details.
 struct FdState { off: usize, opt: FdOpt, flk: u8 }
 impl FdState {
     fn create(opt: FdOpt) -> Arc<RwLock<Self>> { sync_trace!("ENTER fs:create");
@@ -2388,13 +2422,16 @@ impl FdState {
 
 #[derive(Clone)]
 pub struct FHandle {
+    // The path and data should be converted into the Inode.
     pub path: String,
     pub data: Arc<Mutex<Vec<u8>>>,
     desc: Arc<RwLock<FdState>>,
+    // With the FileLike using enum to cover the pipe, the field should be discarded.
     pub pipe: bool,
     pub cloexec: bool,
 }
 
+// We have the seek() but not support the SYS_LSEEK from user space.
 #[derive(Debug)]
 pub enum FSeek { Start(usize), End(isize), Cur(isize) }
 
@@ -2411,6 +2448,7 @@ impl FHandle {
     pub fn open(path: &str, opt: FdOpt, cloexec: bool) -> Self { sync_trace!("ENTER fs:open");
         Self::new(path, opt, false, cloexec)
     }
+    // A bit confused: no system calls or operations can create the file with data. May be for test??
     pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self { sync_trace!("ENTER fs:with_data");
         Self {
             path: path.to_string(),
@@ -2420,6 +2458,7 @@ impl FHandle {
             cloexec: false,
         }
     }
+    // The dup() is used to duplicate the file handle, with the close-on-exec flag set as a parameter.
     pub fn dup(&self, cloexec: bool) -> Self { sync_trace!("ENTER fs:dup");
         FHandle {
             path: self.path.clone(),
@@ -2429,13 +2468,14 @@ impl FHandle {
             cloexec,
         }
     }
+    // For behavioral flags change, why we miss the append flag??
     pub fn set_opt(&self, arg: usize) { sync_trace!("ENTER fs:set_opt");
         sync_trace!("FHandle::set_opt: lock self.desc(W)");
         let mut d = self.desc.write().unwrap();
         d.opt.nb = (arg & O_NONBLOCK) != 0;
     }
     pub fn get_opt(&self) -> FdOpt { sync_trace!("ENTER fs:get_opt"); sync_trace!("FHandle::get_opt: lock self.desc(R)"); self.desc.read().unwrap().opt }
-
+    // Read from the current offset and increase it, while the length is determained by the buffer size and the remaining data size.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:read");
         sync_trace!("FHandle::read: lock self.desc(R)");
         let off = self.desc.read().unwrap().off;
@@ -2448,6 +2488,7 @@ impl FHandle {
         sync_trace!("FHandle::read_at: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.rd { return Err("ebadf"); }
         sync_trace!("FHandle::read_at: lock self.desc(R)");
+        // What is the difference of the blocking/non-blocking I/O??
         if self.desc.read().unwrap().opt.nb {
             sync_trace!("FHandle::read_at: lock self.data");
             let d = self.data.lock().unwrap();
@@ -2464,6 +2505,7 @@ impl FHandle {
         Ok(n)
     }
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:write");
+        // The APPEND flag will force the cursor to the end of the file once the write operation is called.
         let off = {
             sync_trace!("FHandle::write: lock self.desc(R)");
             let d = self.desc.read().unwrap();
@@ -2494,28 +2536,7 @@ impl FHandle {
         };
         Ok(d.off)
     }
-
-    pub fn transfer(&self, dir: u8, offset: Option<usize>, buf_rd: Option<&mut [u8]>, buf_wr: Option<&[u8]>) -> Result<usize, &'static str> { sync_trace!("ENTER fs:transfer");
-        let _path_hash = {
-            let mut h: u64 = 0x811c9dc5;
-            for b in self.path.bytes() { h ^= b as u64; h = h.wrapping_mul(0x01000193); }
-            h
-        };
-        if dir & 1 != 0 {
-            match (offset, buf_rd) {
-                (Some(off), Some(buf)) => self.read_at(off, buf),
-                (None, Some(buf)) => self.read(buf),
-                _ => Err("einval"),
-            }
-        } else {
-            match (offset, buf_wr) {
-                (Some(off), Some(buf)) => self.write_at(off, buf),
-                (None, Some(buf)) => self.write(buf),
-                _ => Err("einval"),
-            }
-        }
-    }
-
+    // Used by ftruncate that truncate a file to a specified length.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> { sync_trace!("ENTER fs:set_len");
         sync_trace!("FHandle::set_len: lock self.desc(R)");
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
@@ -2523,9 +2544,11 @@ impl FHandle {
         self.data.lock().unwrap().resize(len as usize, 0);
         Ok(())
     }
+    // Used by fsync and fdatasync that flush the data(including the metadata if fsync) to the disk.
     pub fn sync_all(&self) -> Result<(), &'static str> { sync_trace!("ENTER fs:sync_all"); Ok(()) }
     pub fn sync_data(&self) -> Result<(), &'static str> { sync_trace!("ENTER fs:sync_data"); Ok(()) }
     pub fn metadata_sz(&self) -> usize { sync_trace!("ENTER fs:metadata_sz"); sync_trace!("FHandle::metadata_sz: lock self.data"); self.data.lock().unwrap().len() }
+    // Walking on the directories, not care this time.
     pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> { sync_trace!("ENTER fs:lookup"); Ok(()) }
     pub fn read_entry(&self) -> Result<String, &'static str> { sync_trace!("ENTER fs:read_entry");
         sync_trace!("FHandle::read_entry: lock self.desc(W)");
@@ -2535,11 +2558,16 @@ impl FHandle {
         d.off += 1;
         Ok(format!("entry_{}", off))
     }
+    // A file is always ready to read/write, while a pipe/network may not. (What if waiting for disk??)
     pub fn poll_status(&self) -> (bool, bool, bool) { sync_trace!("ENTER fs:poll_status"); (true, true, false) }
+    // !!Mechanisms around the ioctl are needed to be worked out
     pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> { sync_trace!("ENTER fs:io_ctl"); Ok(0) }
+    // The vm of the process should be changed in the operation here.
     pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> { sync_trace!("ENTER fs:mmap"); Ok(()) }
+    // Should return the inode reference in the file handle, using data array instead.
     pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> { sync_trace!("ENTER fs:inode_ref"); self.data.clone() }
 
+    // !!The four functions below is hard to understand. Why are they here?
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> { sync_trace!("ENTER fs:advise_readahead");
         sync_trace!("FHandle::advise_readahead: lock self.data");
         let d = self.data.lock().unwrap();
@@ -2573,6 +2601,27 @@ impl FHandle {
         sync_trace!("FHandle::splice_to: lock self.desc(W)");
         self.desc.write().unwrap().off += n;
         dst.write(&chunk)
+    }
+
+    pub fn transfer(&self, dir: u8, offset: Option<usize>, buf_rd: Option<&mut [u8]>, buf_wr: Option<&[u8]>) -> Result<usize, &'static str> { sync_trace!("ENTER fs:transfer");
+        let _path_hash = {
+            let mut h: u64 = 0x811c9dc5;
+            for b in self.path.bytes() { h ^= b as u64; h = h.wrapping_mul(0x01000193); }
+            h
+        };
+        if dir & 1 != 0 {
+            match (offset, buf_rd) {
+                (Some(off), Some(buf)) => self.read_at(off, buf),
+                (None, Some(buf)) => self.read(buf),
+                _ => Err("einval"),
+            }
+        } else {
+            match (offset, buf_wr) {
+                (Some(off), Some(buf)) => self.write_at(off, buf),
+                (None, Some(buf)) => self.write(buf),
+                _ => Err("einval"),
+            }
+        }
     }
 }
 
@@ -2621,6 +2670,7 @@ impl PipeNode {
         if self.dir != PipeDir::Rd { return false; }
         sync_trace!("PipeNode::can_read: lock self.data");
         let d = self.data.lock().unwrap();
+        // Read if there is data or the write end is gone.
         d.buf.len() > 0 || d.ends < 2
     }
     pub fn can_write(&self) -> bool { sync_trace!("ENTER fs:can_write");
@@ -2655,6 +2705,7 @@ impl PipeNode {
 #[derive(Clone, Copy)]
 pub struct EpData { pub ptr: u64 }
 
+// The EpollEvent structure is used to describe the events that can be monitored by epoll. Used in SYS_EPOLL_CTL
 #[derive(Clone)]
 pub struct EpEvent { pub events: u32, pub data: EpData }
 impl EpEvent {
@@ -2763,6 +2814,7 @@ impl FLike {
         }
     }
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> { sync_trace!("ENTER fs:read");
+        //!! Need sealing.
         if buf.is_empty() { return Ok(0); }
         let _pre_tick = CLK.load(Ordering::Relaxed);
         match self {
@@ -5452,6 +5504,25 @@ impl Kernel {
         })
     }
 
+    /// Dispatch a system call.  The seven parameters mirror the hardware ABI:
+    /// `nr` identifies the syscall number, while `a0`..`a5` are the six
+    /// argument slots defined by the calling convention:
+    ///
+    /// │ Role            │ x86-64    │ RISC-V    │ AArch64   │
+    /// │─────────────────│───────────│───────────│───────────│
+    /// │ Syscall number  │ `rax`     │ `a7` x17  │ `x8`      │
+    /// │ Arg 0 (a0)      │ `rdi`     │ `a0` x10  │ `x0`      │
+    /// │ Arg 1 (a1)      │ `rsi`     │ `a1` x11  │ `x1`      │
+    /// │ Arg 2 (a2)      │ `rdx`     │ `a2` x12  │ `x2`      │
+    /// │ Arg 3 (a3)      │ `r10`     │ `a3` x13  │ `x3`      │
+    /// │ Arg 4 (a4)      │ `r8`      │ `a4` x14  │ `x4`      │
+    /// │ Arg 5 (a5)      │ `r9`      │ `a5` x15  │ `x5`      │
+    /// │ Trigger         │ `syscall` │ `ecall`   │ `svc #0`  │
+    /// │ Return value    │ `rax`     │ `a0` x10  │ `x0`      │
+    ///
+    /// Unused arguments are ignored.  The return value from the kernel is
+    /// placed back into the return register (the same register as a0) by
+    /// the trap‑return path in `trap.rs`.
     pub fn dispatch_syscall(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> { sync_trace!("ENTER syscall:dispatch_syscall");
         sync_trace!("op=syscall nr={} a0={} a1={} a2={}", nr, a0, a1, a2);
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
@@ -5529,6 +5600,21 @@ impl Kernel {
                 }
                 Ok(actual_len)
             }
+            /// `open(path, flags, mode)` — creates a new open file description and
+            /// binds it to the lowest available fd in the current task's fd table.
+            ///
+            /// Three classes of flags are parsed from `a1`:
+            ///   1. Access mode (bits 0‑1): O_RDONLY / O_WRONLY / O_RDWR — these
+            ///      become `FdOpt.rd`/`FdOpt.wr` and control read/write permission.
+            ///   2. Persistent behavioural flags: O_APPEND → FdOpt.ap,
+            ///      O_NONBLOCK → FdOpt.nb — stored in FdOpt and enforced on every
+            ///      subsequent I/O operation on this fd.
+            ///   3. Creation‑time flags: O_CREAT / O_EXCL / O_TRUNC / O_CLOEXEC —
+            ///      affect the *open* operation itself (atomic create‑or‑fail,
+            ///      truncation, close‑on‑exec) but are NOT stored in the fd.
+            ///
+            /// `a2` (mode) carries the permission bits for a newly‑created file;
+            /// it is only meaningful when O_CREAT is present.
             SYS_OPEN => {
                 let path_addr = a0;
                 let flags = a1;
@@ -5763,6 +5849,25 @@ impl Kernel {
                     Err("esrch")
                 }
             }
+            /// `dup(old_fd)`, `dup2(old_fd, new_fd)`, `dup3(old_fd, new_fd, flags)`
+            ///
+            /// Duplicate a file descriptor.  All three create a new fd that shares
+            /// the *same* open file description (FHandle / PipeNode / EpInst) as
+            /// the old fd — the underlying `Arc` references are cloned, so the
+            /// cursor offset and FdOpt are shared.
+            ///
+            ///   dup(fd)  – returns the lowest available fd; cloexec is inherited
+            ///               from the old fd (hardcoded `false` here).
+            ///   dup2(fd, n) – assigns new fd `n`, atomically closing `n` if open;
+            ///               returns `n` immediately if old_fd == new_fd.
+            ///   dup3(fd, n, O_CLOEXEC) – Linux‑specific; like dup2 but allows
+            ///               the caller to set FD_CLOEXEC on the new fd.  Not
+            ///               implemented as a separate syscall here, but the
+            ///               equivalent is available via fcntl(F_DUPFD_CLOEXEC).
+            ///
+            /// All dup operations increment ref‑counts: the open file description
+            /// (and its lock state, if any) is not released until the *last* fd
+            /// referencing it is closed.
             SYS_DUP => {
                 let old_fd = a0;
                 if old_fd >= N_PROC * 4 { return Err("ebadf"); }
@@ -6152,6 +6257,16 @@ impl Kernel {
                     Err("esrch")
                 }
             }
+            /// epoll_create1(0) — creates a new epoll instance and returns an fd
+            /// that refers to it.
+            ///
+            /// Correct implementation should:
+            ///   1. Allocate an `EpInst` (BTreeMap<fd, EpEvent> + ready set).
+            ///   2. Insert `FLike::Ep(epinst)` into the current task's fd table.
+            ///   3. Return the newly‑allocated fd.
+            ///
+            /// The `size` hint has been ignored since Linux 2.6.8; this mock uses
+            /// it only for a synthetic fd number and overflow‑check simulation.
             SYS_EPOLL_CREATE => {
                 let size = a0;
                 if size == 0 { return Err("einval"); }
@@ -6160,6 +6275,27 @@ impl Kernel {
                 if _backing.is_none() { return Err("enomem"); }
                 Ok(epfd)
             }
+            /// epoll_ctl(epfd, op, fd, &event) — add, modify, or remove a watched
+            /// fd from an epoll instance.
+            ///
+            ///   op=1  ADD    – register fd with the given event mask.  Must then
+            ///                   subscribe to that fd's EvBus (via EvBus::sub) so
+            ///                   that future readiness changes are pushed into
+            ///                   EpInst.ready.
+            ///   op=2  DEL    – remove fd from EpInst.events.  The event mask
+            ///                   (ev_addr) is ignored for DEL.
+            ///   op=3  MOD    – update the event mask for an already‑registered fd;
+            ///                   returns EPERM if fd was never ADDed.
+            ///
+            /// ADD/MOD must copy the `struct epoll_event` from user memory
+            /// (ev_addr) and store it in EpInst.events.  DEL simply removes the
+            /// entry.  The last two argument slots (a4, a5) are unused — epoll_ctl
+            /// takes exactly 4 parameters.
+            ///
+            /// Current state: validation of ev_addr is present, but the EpInst
+            /// structures tracked by Task are never populated and the EvBus
+            /// subscription (the callback wiring) is missing — see EpInst::control
+            /// in fs.rs for the intended logic.
             SYS_EPOLL_CTL => {
                 let epfd = a0;
                 let op = a1 as i32;
@@ -6175,6 +6311,23 @@ impl Kernel {
                     _ => Err("einval"),
                 }
             }
+            /// epoll_wait(epfd, events, maxevents, timeout) — wait for one or more
+            /// watched fds to become ready.
+            ///
+            /// Correct implementation should:
+            ///   1. Validate the user buffer (events_addr) as already done.
+            ///   2. If EpInst.ready is non‑empty: copy up to maxevents entries
+            ///      from EpInst.ready into the user buffer, clear those entries
+            ///      from ready, and return the count.
+            ///   3. If ready is empty and timeout == 0: return 0 immediately.
+            ///   4. If ready is empty and timeout > 0: park the calling thread
+            ///      until the deadline expires or an EvBus callback inserts an fd
+            ///      into EpInst.ready and wakes this waiter.
+            ///   5. If timeout == -1: block indefinitely.
+            ///
+            /// The callback wiring that populates EpInst.ready (from EvBus::sub) is
+            /// not yet connected, so this mock always returns Ok(0) — no events
+            /// are ever reported.
             SYS_EPOLL_WAIT => {
                 let epfd = a0;
                 let events_addr = a1;
